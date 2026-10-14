@@ -33,8 +33,16 @@ class WAFRule:
         elif self.rule_type == "block_user_agent":
             return f'if ($http_user_agent ~ "{self.condition}") {{ return 403; }}'
         elif self.rule_type == "rate_limit":
-            # Use existing zone defined in main nginx config to avoid conflicts
-            return f"limit_req zone=main burst=5 nodelay;"
+            # Only ever emit a zone we created ourselves.
+            #
+            # A generated dynamic rule file can be included at the same
+            # configuration level as the vhost that includes it. Emitting
+            # `limit_req zone=main` (a zone the vhost defines and already uses
+            # at server level) therefore produces
+            #     [emerg] "limit_req" directive is duplicate
+            # and nginx refuses to load ANY of the rules in the file. A dynamic
+            # rate-limit rule must not touch the vhost's own zones.
+            return f"limit_req zone=waf_dynamic burst=5 nodelay;"
         else:
             return f"# {self.description}"
     
