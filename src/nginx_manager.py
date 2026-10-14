@@ -27,6 +27,13 @@ import base64
 from loguru import logger
 from pathlib import Path
 
+# Directory that holds the AI-generated rule files. In the Docker setup this is
+# the shared volume the nginx nodes mount at /etc/nginx/waf-rules, so a file
+# written here is the file the nodes load. Exposed as module state (rather than
+# a literal inside the deploy method) so it can be redirected in tests and
+# configured per deployment.
+SHARED_WAF_DIR = os.getenv("WAF_SHARED_RULES_DIR", "/app/waf-rules")
+
 
 @dataclass
 class NginxNode:
@@ -440,8 +447,9 @@ class NginxManager:
     async def _deploy_via_file(self, node: NginxNode, nginx_config: str) -> bool:
         """Deploy configuration via shared volume for Docker environments"""
         try:
-            # For Docker environments, write to shared volume mounted at /app/waf-rules
-            shared_waf_dir = "/app/waf-rules"
+            # For Docker environments, write to shared volume mounted at
+            # WAF_SHARED_RULES_DIR (default /app/waf-rules).
+            shared_waf_dir = SHARED_WAF_DIR
             
             # Create directory if it doesn't exist
             os.makedirs(shared_waf_dir, exist_ok=True)
@@ -456,23 +464,40 @@ class NginxManager:
             
             logger.info(f"File deployment successful for {node.node_id}: wrote to {rules_file}")
             
-            # Try to reload nginx in the container
+            # The rule file is now STAGED on disk. It is NOT active until nginx
+            # loads it, and a staged rule protects nothing.
+            #
+            # Reloading needs an execution path into the node container. The API
+            # container has no docker CLI, no nginx binary and no daemon socket,
+            # so in the Docker setup this reload cannot succeed. Providing a real
+            # activation path is item 0A.3; until then this method reports the
+            # truth rather than claiming a protection it is not providing.
+            reload_ok = False
             try:
                 import subprocess
                 reload_cmd = f"docker exec {node.node_id} nginx -s reload"
                 result = subprocess.run(reload_cmd.split(), capture_output=True, text=True, timeout=10)
-                
+
                 if result.returncode == 0:
-                    logger.info(f"Successfully reloaded nginx for {node.node_id}")
+                    reload_ok = True
+                    logger.info(f"Reloaded nginx for {node.node_id}; rules are ACTIVE")
                 else:
-                    logger.warning(f"Failed to reload nginx for {node.node_id}: {result.stderr}")
-                    # Still return True since the file was written successfully
-                
+                    detail = (result.stderr or result.stdout or "").strip()
+                    logger.error(
+                        f"Rules for {node.node_id} are STAGED but NOT ACTIVE: "
+                        f"reload failed ({detail})"
+                    )
+
             except Exception as reload_error:
-                logger.warning(f"Could not reload nginx for {node.node_id}: {reload_error}")
-                # Still return True since the file was written successfully
-            
-            return True
+                logger.error(
+                    f"Rules for {node.node_id} are STAGED but NOT ACTIVE: "
+                    f"could not reload ({reload_error})"
+                )
+
+            # Fail closed. Callers read True as "these rules are in force", so
+            # returning True here was the false-success defect: the system
+            # claimed protection while nginx was still serving the old config.
+            return reload_ok
             
         except Exception as e:
             logger.error(f"File deployment failed for {node.node_id}: {e}")
@@ -622,50 +647,7 @@ class NginxManager:
                     if backup_path:
                         self._rollback_config(ssh, node, backup_path, remote_path)
                     return False
-                try:
-                    remote_path = f"{node.nginx_config_path}/waf_rules_auto.conf"
-                    backup_path = f"{remote_path}.backup.{int(datetime.now().timestamp())}"
-                    
-                    # Create backup of existing config if it exists
-                    try:
-                        sftp.rename(remote_path, backup_path)
-                        logger.debug(f"Created backup: {backup_path}")
-                    except FileNotFoundError:
-                        # No existing file to backup
-                        pass
-                    
-                    # Upload new configuration
-                    sftp.put(temp_config_path, remote_path)
-                    
-                    # Set proper permissions on remote file
-                    sftp.chmod(remote_path, 0o644)
-                    
-                finally:
-                    sftp.close()
-                
-                # Test nginx configuration before reload
-                logger.debug(f"Testing nginx configuration on {node.node_id}")
-                stdin, stdout, stderr = ssh.exec_command("nginx -t", timeout=30)
-                exit_code = stdout.channel.recv_exit_status()
-                
-                if exit_code != 0:
-                    error_output = stderr.read().decode()
-                    logger.error(f"Nginx config test failed on {node.node_id}: {error_output}")
-                    return False
-                
-                # Reload nginx with timeout
-                logger.debug(f"Reloading nginx on {node.node_id}")
-                stdin, stdout, stderr = ssh.exec_command(node.nginx_reload_command, timeout=30)
-                exit_code = stdout.channel.recv_exit_status()
-                
-                if exit_code != 0:
-                    error_output = stderr.read().decode()
-                    logger.error(f"Nginx reload failed on {node.node_id}: {error_output}")
-                    return False
-                
-                logger.info(f"Successfully deployed configuration to {node.node_id}")
-                return True
-                
+
             finally:
                 # Clean up temporary config file
                 if temp_config_path and os.path.exists(temp_config_path):
