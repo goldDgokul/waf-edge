@@ -15,6 +15,12 @@ A machine learning system for nginx Web Application Firewall (WAF) rule generati
 
 ---
 
+## Origin and attribution
+
+This repository is built on **[nginx-waf-ai](https://github.com/fabriziosalmi/nginx-waf-ai)** by Fabrizio Salmi (MIT licensed), used as a reference and starting point at commit `29ab841`. The upstream project remains available as the `upstream` git remote for comparison.
+
+The multi-tenant hosted-edge architecture, and all work from Phase 0 onward described in the project plan, are original to this repository and are not part of the upstream project.
+
 ## Overview
 
 Nginx WAF AI analyzes HTTP traffic patterns, detects threats using machine learning, and generates protective WAF rules for nginx deployments. The system exposes a REST API, includes a web-based control panel, and ships with a CLI for common operations.
