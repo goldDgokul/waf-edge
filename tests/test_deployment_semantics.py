@@ -105,8 +105,21 @@ async def test_reload_failure_is_not_reported_as_success(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_successful_reload_is_reported_as_success(tmp_path, monkeypatch):
-    """The positive case must not be broken by the fix."""
+async def test_successful_reload_is_not_treated_as_activation(tmp_path, monkeypatch):
+    """
+    A successful reload must NOT be read as "the rules are active".
+
+    UPDATED for the Step 3 rebuild. This test previously asserted the OPPOSITE:
+    that a reload returning 0 made _deploy_via_file return True. That is the
+    false-success defect. `nginx -s reload` only reports that a signal was
+    delivered - it returns 0 even for an invalid configuration, and it says
+    nothing about whether the candidate was ever parsed.
+
+    The file transport has no way to validate or reload the node at all (no
+    docker CLI, no socket, no nginx in the container it runs in), so it must
+    report failure in EVERY case - including when a reload call appears to
+    succeed.
+    """
     manager = NginxManager([])
     if not _redirect_shared_dir(tmp_path):
         pytest.skip("shared rules directory is not exposed as module state")
@@ -115,14 +128,23 @@ async def test_successful_reload_is_reported_as_success(tmp_path, monkeypatch):
 
     ok = await manager._deploy_via_file(_node(), "# rules\n")
 
-    assert ok is True
+    assert ok is False, (
+        "a reload exit code of 0 was reported as successful activation. That code "
+        "means only that the signal was delivered; it returns 0 for an invalid "
+        "config too, so it cannot establish that rules are in force."
+    )
 
 
 @pytest.mark.asyncio
 async def test_rule_file_is_still_written(tmp_path, monkeypatch):
     """
-    The staged file must still be written, so a later reload (or an operator)
-    can pick it up. The fix changes the reported OUTCOME, not the write.
+    The candidate must still be written, so a later reload (or an operator) can
+    pick it up. The fix changes WHERE it lands and the reported OUTCOME, not the
+    fact of the write.
+
+    UPDATED for the Step 3 rebuild: the file is written to a unique temporary
+    name and promoted to agent-<node>/rules.conf by rename, so a reader never
+    sees a partial file and no leftovers remain in the rules directory.
     """
     manager = NginxManager([])
     if not _redirect_shared_dir(tmp_path):
@@ -132,9 +154,14 @@ async def test_rule_file_is_still_written(tmp_path, monkeypatch):
 
     await manager._deploy_via_file(_node(), "# staged rules\n")
 
-    written = list(tmp_path.glob("dynamic-*.conf"))
+    written = [p for p in tmp_path.rglob("*") if p.is_file()]
     assert written, "the rule file was not written at all"
     assert "staged rules" in written[0].read_text(encoding="utf-8")
+
+    assert written[0].parent.name.startswith("agent-"), (
+        "the candidate was not written into the per-node directory the vhost "
+        f"includes, so it would never be loaded: {written[0]}"
+    )
 
 
 # -----------------------------------------------------------------------------

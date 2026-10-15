@@ -1340,8 +1340,28 @@ async def process_threats_continuously():
                             # Deploy rules to nginx nodes
                             logger.info(f"THREAT PROCESSOR: Deploying {len(new_rules)} rules to nginx nodes...")
                             nginx_config = waf_rule_generator.generate_nginx_config(new_rules)
-                            await nginx_manager.deploy_rules_to_all_nodes(nginx_config)
-                            logger.info("THREAT PROCESSOR: Rules deployed successfully")
+                            deployment_results = await nginx_manager.deploy_rules_to_all_nodes(nginx_config)
+
+                            # Consume the result. This is the AUTOMATIC path - it runs on
+                            # its own with nobody watching - so an unconditional success
+                            # log here is the worst place for a false signal: the system
+                            # would tell itself it was protecting people when it was not.
+                            # A rule that is staged but not loaded protects nothing.
+                            failed_nodes = [nid for nid, ok in (deployment_results or {}).items() if not ok]
+                            if failed_nodes:
+                                logger.error(
+                                    f"THREAT PROCESSOR: Rules NOT active on {failed_nodes} "
+                                    f"(staged but not loaded); {len(new_rules)} rules are not protecting traffic"
+                                )
+                            elif deployment_results:
+                                logger.info(
+                                    f"THREAT PROCESSOR: Rules deployed and active on "
+                                    f"{list(deployment_results.keys())}"
+                                )
+                            else:
+                                logger.warning(
+                                    "THREAT PROCESSOR: Deployment returned no node results"
+                                )
                     else:
                         logger.debug("THREAT PROCESSOR: No threats detected in this cycle")
                 else:
@@ -1473,13 +1493,46 @@ async def deploy_rules(
                 else:
                     metrics.configuration_reloads.labels(node_id=node_id, status='failed').inc()
             
-            # Check deployment results
-            failed_deployments = [node_id for node_id, success in deployment_results.items() if not success]
+            # Check deployment results.
+            #
+            # This used to raise only when EVERY node failed, and then log
+            # "Rules deployed successfully" unconditionally. A PARTIAL failure -
+            # one node enforcing, one not - was therefore reported as success, and
+            # an operator reading "deployed" would believe the rule was in force
+            # everywhere. In a security product that is the worst kind of wrong.
+            #
+            # A deployment is only successful if EVERY node it targeted confirms
+            # the rules are active. Anything less is reported as a failure, with
+            # the per-node results preserved so the operator can see which nodes
+            # are protecting traffic and which are not.
+            failed_deployments = [
+                node_id for node_id, success in deployment_results.items() if not success
+            ]
             if failed_deployments:
-                logger.warning(f"Deployment failed for nodes: {failed_deployments}")
-                if len(failed_deployments) == len(deployment_results):
-                    raise HTTPException(status_code=500, detail="Deployment failed on all nodes")
-        
+                active_nodes = [
+                    node_id for node_id, success in deployment_results.items() if success
+                ]
+                logger.error(
+                    f"Deployment NOT fully active. Failed nodes: {failed_deployments}; "
+                    f"active nodes: {active_nodes or 'none'}. "
+                    f"{len(rules)} rule(s) are NOT protecting traffic on "
+                    f"{len(failed_deployments)} node(s)."
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": (
+                            "Deployment did not become active on every node. "
+                            "Rules are staged but NOT ACTIVE on the failed nodes, "
+                            "so they are not protecting traffic there."
+                        ),
+                        "failed_nodes": failed_deployments,
+                        "active_nodes": active_nodes,
+                        "deployment_results": deployment_results,
+                    },
+                )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Deployment error: {e}")
             # Update failed deployment metrics
@@ -1487,15 +1540,19 @@ async def deploy_rules(
                 for node_id in deployment_results.keys():
                     metrics.configuration_reloads.labels(node_id=node_id, status='failed').inc()
             raise HTTPException(status_code=500, detail=f"Deployment failed: {str(e)}")
-        
-        logger.info("Rules deployed successfully")
+
+        # Reached only when EVERY targeted node confirmed the rules are active.
+        logger.info(
+            f"Rules deployed and confirmed ACTIVE on all nodes: "
+            f"{list(deployment_results.keys())}"
+        )
         return {
-            "message": "Rules deployment initiated",
+            "message": "Rules deployed and confirmed active on all nodes",
             "deployment_results": deployment_results,
             "total_rules": len(rules),
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:

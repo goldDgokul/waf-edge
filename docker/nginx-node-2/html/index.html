@@ -52,21 +52,39 @@
         </div>
 
         <h3>🧪 Testing Commands</h3>
-        <p>Test this server with various requests:</p>
-        <pre><code># Normal request
+        <p>Test this server with various requests. Every command below was run
+           against this node and the status shown is what it actually returns.</p>
+        <pre><code># Normal request  -> 200
 curl http://localhost:8082/
 
-# API request
+# API request  -> 200
 curl http://localhost:8082/api/products
 
-# Potential SQL injection (will be detected)
-curl "http://localhost:8082/api/orders?id=1' UNION SELECT * FROM users--"
+# SQL injection attempt  -> 403 (blocked)
+# The payload must be URL-safe: spaces as + , and it is quoted, so the shell
+# does not eat the quote character. An unencoded space makes curl refuse the URL
+# outright (curl: (3) URL rejected) and NOTHING reaches the WAF at all.
+curl "http://localhost:8082/api/orders?id=1+UNION+SELECT+*+FROM+users--"
 
-# XSS attempt (will be detected)
-curl "http://localhost:8082/api/cart?item=&lt;img src=x onerror=alert('xss')&gt;"
+# XSS attempt  -> 403 (blocked)
+curl "http://localhost:8082/api/cart?item=&lt;img+src=x+onerror=alert(1)&gt;"
 
-# Dashboard access
+# Admin dashboard  -> 200
 curl http://localhost:8082/dashboard/</code></pre>
+
+        <h3>⚠️ What these rules do NOT catch</h3>
+        <p>Stated plainly, because a test that looks like it passed is worse than a
+           known gap. These return 200 on this node:</p>
+        <pre><code># SQL injection without a keyword the rule looks for  -> 200 (NOT blocked)
+curl "http://localhost:8082/api/orders?id=1+OR+1=1--"
+
+# URL-encoded metacharacters defeat the pattern match  -> 200 (NOT blocked)
+# %3D is "=", so the rule's "onerror=" never matches the raw query string.
+curl "http://localhost:8082/api/cart?item=%3Cimg+src%3Dx+onerror%3Dalert(1)%3E"</code></pre>
+        <p>Sending a raw <code>&lt;</code> or a space inside a quoted URL can also be
+           rejected by curl before the request leaves the machine. If you see
+           <code>curl: (3) URL rejected</code>, nothing was tested — the request never
+           arrived.</p>
 
         <p style="margin-top: 30px; text-align: center; color: #7f8c8d;">
             This e-commerce server is monitored by the nginx WAF AI system for threat detection and automatic rule generation.

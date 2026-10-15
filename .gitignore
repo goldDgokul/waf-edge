@@ -55,6 +55,17 @@ models/*.joblib
 models/*.pkl
 data/*.json
 
+# Runtime WAF rules: generated per node by the deployment pipeline.
+# These are OUTPUT, not source. Committing them is what made a fresh clone
+# depend on a file the app is supposed to create, and it masked the fact that
+# the vhost include had nothing to load on a clean machine.
+#
+# NOT `docker/shared/waf-rules/*` - basic.conf lives there and is real source:
+# it holds the map blocks that drive the in-line SQLi/XSS/extension checks.
+# Ignoring the directory would ignore the WAF's own detection rules.
+docker/shared/waf-rules/dynamic-*.conf
+docker/shared/waf-rules/agent-*/
+
 # Environment
 .env
 .env.local

@@ -100,15 +100,39 @@ def test_dynamic_rule_include_is_not_at_http_scope(node_dir):
 @pytest.mark.parametrize("node_dir", NODE_DIRS, ids=lambda p: p.name)
 def test_dynamic_rule_include_is_inside_server_block(node_dir):
     """
-    The dynamic rule file must be included somewhere nginx allows `if`.
+    The generated rule file must be included somewhere nginx allows `if`.
+
+    UPDATED for 0A.3: the include is no longer a literal `dynamic-<node>.conf`.
+    There is now exactly ONE rule include, and it is a wildcard over a per-node
+    directory:
+        include /etc/nginx/waf-rules/agent-node_1/*.conf;
+    The invariant this test protects is unchanged - the include must be at SERVER
+    scope, because generated rules contain `if` - but the shape it looks for is
+    the single per-node wildcard, and there must be exactly one of them.
     """
     default_conf = _read(node_dir / "default.conf")
     directives = _strip_comments(default_conf)
 
     assert "server {" in directives, "default.conf has no server block"
-    assert re.search(r"include\s+\S*dynamic-\S+\.conf\s*;", directives), (
-        "default.conf does not include the dynamic rule file inside its server "
-        "block, so generated `if`-based rules have nowhere legal to be loaded"
+
+    # Read the server block and take the includes inside it.
+    body = directives.split("server {", 1)[1]
+    rule_includes = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip().startswith("include") and "waf-rules" in line
+    ]
+
+    assert rule_includes, (
+        "default.conf includes no generated rule file inside its server block, so "
+        "generated `if`-based rules have nowhere legal to be loaded"
+    )
+    assert len(rule_includes) == 1, (
+        "there must be exactly ONE rule include per node. Two mechanisms at one "
+        f"scope is what let the same batch land twice: {rule_includes}"
+    )
+    assert re.search(r"include\s+\S*agent-\S*\*\.conf\s*;", rule_includes[0]), (
+        f"the single rule include is not the per-node wildcard: {rule_includes[0]}"
     )
 
 

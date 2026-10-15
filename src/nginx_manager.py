@@ -35,6 +35,48 @@ from pathlib import Path
 SHARED_WAF_DIR = os.getenv("WAF_SHARED_RULES_DIR", "/app/waf-rules")
 
 
+def rule_destination_for(node_id: str) -> str:
+    """
+    The ONE destination for a node's generated rules, relative to the rules root.
+
+    EVERY transport builds its path from this function, so the two can never
+    disagree about where rules live.
+
+    WHAT ACTUALLY HAPPENED, so nobody re-derives a wrong fix (corrected
+    2026-10-15 after an independent review falsified an earlier version of this
+    comment):
+
+      - At commit b0b35b3 the Docker/file transport wrote
+        `<rules_root>/dynamic-<node>.conf`, while the SSH transport wrote
+        `{node.nginx_config_path}/waf_rules_auto.conf`, i.e.
+        /etc/nginx/conf.d/waf_rules_auto.conf. They did NOT both write
+        agent-<node>/rules.conf. An earlier version of this docstring claimed
+        otherwise and was wrong.
+      - The SSH transport had never actually run: it called
+        tempfile.mkstemp(mode=..., delete=...), which raises TypeError, so it
+        aborted before deploying anything.
+      - The vhost's literal include of dynamic-node_<node>.conf was removed
+        because a SECOND include of a generated file at the same scope makes the
+        same batch land twice, and nginx rejects a duplicate `limit_req` by
+        discarding EVERY rule in the file. That two-include state was an
+        uncommitted ad-hoc edit, not a shipped revision - the failure is real and
+        reproducible, but it was never what git contained.
+
+    The shape is not a preference - it is set by the vhost include:
+        include /etc/nginx/waf-rules/agent-<node>/*.conf;
+    so the directory must be `agent-<node>` and the file must end in `.conf`.
+    Anything else is invisible to nginx: a write that can report success while
+    protecting nothing.
+
+    Relative, not absolute, because the two transports reach the same directory
+    by different routes - the API container sees it as /app/waf-rules, the node
+    sees it as /etc/nginx/waf-rules, and the SSH transport reaches the remote
+    copy. Each joins this to its own root.
+    """
+    return os.path.join(f"agent-{node_id}", "rules.conf")
+
+
+
 @dataclass
 class NginxNode:
     """Represents an nginx node in the cluster"""
@@ -445,62 +487,84 @@ class NginxManager:
             return False
     
     async def _deploy_via_file(self, node: NginxNode, nginx_config: str) -> bool:
-        """Deploy configuration via shared volume for Docker environments"""
+        """
+        Write generated rules into the shared rules volume.
+
+        THIS TRANSPORT CANNOT ACTIVATE RULES, AND DOES NOT CLAIM TO.
+
+        Returning True is read by callers as "these rules are enforcing". This
+        method has no way to establish that, so it returns False and says why.
+        Anything else is a false success, which in a security product is the worst
+        kind of wrong: an operator reads "deployed", believes every node is
+        protected, and stops looking.
+
+        Why it cannot activate, measured 2026-10-15:
+          - The API container has no docker CLI and no /var/run/docker.sock, so it
+            cannot reach the node's nginx. `command -v docker` -> ABSENT, verified
+            live in the running waf-api container.
+          - The reload it used to attempt, `docker exec <node_id> nginx -s reload`,
+            cannot succeed even where docker exists: main.py builds
+            node_id="node_1" while the container is named "nginx-node-1", so the
+            command fails with "No such container: node_1". node_id serves two
+            masters - it is also the RULES identity that must match the vhost
+            include `agent-node_1/*.conf` - so it cannot simply be renamed.
+          - `nginx -s reload` was being read as a validation. It is not one, and
+            the precise reason is narrower than it first appears (measured):
+            it returned 0 for the broken candidate because the candidate was named
+            `.staged`, which the include never matched - so nginx re-read the OLD
+            config and had nothing to complain about. A broken file INSIDE the
+            include makes reload exit 1. Either way the exit code says nothing
+            about whether NEW rules were parsed, which is what was being assumed.
+
+        The real activation path is the SSH transport (_ssh_deploy_sync), which
+        validates with `nginx -t`, reloads, and confirms with `nginx -T`. It has
+        never executed successfully anywhere yet - there is no VM. Until it can
+        run, this method's job is to place the rules and tell the truth.
+
+        Rules are written to the per-node directory the vhost includes, so the
+        next legitimate reload picks them up. Activation is reported as NOT
+        done.
+        """
         try:
-            # For Docker environments, write to shared volume mounted at
-            # WAF_SHARED_RULES_DIR (default /app/waf-rules).
-            shared_waf_dir = SHARED_WAF_DIR
-            
-            # Create directory if it doesn't exist
-            os.makedirs(shared_waf_dir, exist_ok=True)
-            
-            # Write dynamic rules file for this node
-            rules_file = os.path.join(shared_waf_dir, f"dynamic-{node.node_id}.conf")
-            
-            with open(rules_file, 'w') as f:
-                f.write(f"# Dynamic WAF rules for {node.node_id}\n")
-                f.write(f"# Generated at {datetime.now().isoformat()}\n\n")
-                f.write(nginx_config)
-            
-            logger.info(f"File deployment successful for {node.node_id}: wrote to {rules_file}")
-            
-            # The rule file is now STAGED on disk. It is NOT active until nginx
-            # loads it, and a staged rule protects nothing.
+            # ONE destination, shared with the SSH transport via the helper, so the
+            # two can never disagree about where rules live.
+            rules_file = os.path.join(SHARED_WAF_DIR, rule_destination_for(node.node_id))
+            os.makedirs(os.path.dirname(rules_file), exist_ok=True)
+
+            # Write to a temporary name and promote by rename, so a reader never
+            # sees a half-written file. The name does not end in `.conf`, so it is
+            # not matched by the vhost include `agent-<node>/*.conf` - a partial
+            # write can never be loaded as configuration.
             #
-            # Reloading needs an execution path into the node container. The API
-            # container has no docker CLI, no nginx binary and no daemon socket,
-            # so in the Docker setup this reload cannot succeed. Providing a real
-            # activation path is item 0A.3; until then this method reports the
-            # truth rather than claiming a protection it is not providing.
-            reload_ok = False
+            # A UNIQUE name per attempt: a fixed `.staged` name means two
+            # concurrent deploys to the same node overwrite each other's candidate.
+            tmp_file = f"{rules_file}.{os.getpid()}.{threading.get_ident()}.tmp"
             try:
-                import subprocess
-                reload_cmd = f"docker exec {node.node_id} nginx -s reload"
-                result = subprocess.run(reload_cmd.split(), capture_output=True, text=True, timeout=10)
+                with open(tmp_file, "w") as f:
+                    f.write(f"# WAF rules for {node.node_id}\n")
+                    f.write(f"# Generated at {datetime.now().isoformat()}\n\n")
+                    f.write(nginx_config)
+                    f.flush()
+                    # Flush to disk before the rename, so a crash cannot leave a
+                    # torn file under the live name.
+                    os.fsync(f.fileno())
+                os.replace(tmp_file, rules_file)
+            finally:
+                if os.path.exists(tmp_file):
+                    os.unlink(tmp_file)
 
-                if result.returncode == 0:
-                    reload_ok = True
-                    logger.info(f"Reloaded nginx for {node.node_id}; rules are ACTIVE")
-                else:
-                    detail = (result.stderr or result.stdout or "").strip()
-                    logger.error(
-                        f"Rules for {node.node_id} are STAGED but NOT ACTIVE: "
-                        f"reload failed ({detail})"
-                    )
+            logger.warning(
+                f"Rules for {node.node_id} were WRITTEN to {rules_file} but are "
+                f"STAGED, NOT ACTIVE. This transport cannot reload nginx (no docker "
+                f"CLI or socket in this container), so the node keeps serving its "
+                f"previous configuration until a legitimate reload happens. "
+                f"Reporting failure so no caller believes these rules are in force. "
+                f"Real activation requires the SSH path."
+            )
+            return False
 
-            except Exception as reload_error:
-                logger.error(
-                    f"Rules for {node.node_id} are STAGED but NOT ACTIVE: "
-                    f"could not reload ({reload_error})"
-                )
-
-            # Fail closed. Callers read True as "these rules are in force", so
-            # returning True here was the false-success defect: the system
-            # claimed protection while nginx was still serving the old config.
-            return reload_ok
-            
         except Exception as e:
-            logger.error(f"File deployment failed for {node.node_id}: {e}")
+            logger.error(f"Writing rules for {node.node_id} failed: {e}")
             return False
 
     async def _deploy_via_api(self, node: NginxNode, nginx_config: str) -> bool:
@@ -583,70 +647,132 @@ class NginxManager:
                 raise ValueError(f"SSH key required for node {node.node_id}")
             
             # Create secure temporary file for configuration
-            temp_fd, temp_config_path = tempfile.mkstemp(mode='w', suffix='.conf', delete=False)
+            # Create secure temporary file for configuration.
+            #
+            # tempfile.mkstemp() takes (suffix, prefix, dir, text). The previous
+            # call passed mode='w' and delete=False, which are not parameters of
+            # this function, so it raised TypeError EVERY time. That aborted
+            # _ssh_deploy_sync before any deployment code ran, which is why this
+            # path has never actually deployed anything.
+            temp_fd, temp_config_path = tempfile.mkstemp(suffix='.conf', text=True)
             try:
                 with os.fdopen(temp_fd, 'w') as temp_file:
                     temp_file.write(nginx_config)
                 
                 os.chmod(temp_config_path, 0o600)
                 
-                # Enhanced deployment with rollback
-                sftp = ssh.open_sftp()
+                # Deployment with validation and guaranteed cleanup.
+                #
+                # THREE THINGS THIS MUST GET RIGHT:
+                #
+                # 1. NO CROSS-NODE LEAK. Both edge nodes mount the same host
+                #    directory. A wildcard over a SHARED directory means node A
+                #    loads node B's rules - verified live. Each node therefore gets
+                #    its OWN subdirectory, included only by that node's vhost.
+                #
+                # 2. THE CANDIDATE MUST ACTUALLY BE PARSED BY `nginx -t`. A
+                #    `.staged` file is NOT matched by a `*.conf` include, so the
+                #    test would only re-check the CURRENT config and the candidate's
+                #    first real validation would happen after it was already live.
+                #    The candidate is therefore written to the live name so the test
+                #    genuinely parses it.
+                #
+                # 3. FAILURE MUST NOT LEAVE THE NODE BROKEN. The candidate is
+                #    briefly in the live path - bounded by the validation window -
+                #    and on ANY failure, including a FIRST deploy where there is no
+                #    backup, the previous state is restored. The node is never left
+                #    unable to reload or restart.
+                #
+                # The directory is deliberately NOT node.nginx_config_path: that
+                # defaults to /etc/nginx/conf.d, included at http scope, and the
+                # generated rules contain `if`, legal only in server/location.
+                # Writing there reproduces the 0A.1 outage.
+                # One destination rule for both transports. rule_destination_for()
+                # returns "agent-<node>/rules.conf", so this path and the file
+                # path can never disagree again - which is how the duplicate
+                # directive defect happened.
+                REMOTE_RULES_ROOT = "/etc/nginx/waf-rules"
+                final_path = os.path.join(
+                    REMOTE_RULES_ROOT, rule_destination_for(node.node_id)
+                )
+                # os.path.join uses the local separator; on the remote (POSIX) it
+                # must be a forward slash.
+                final_path = final_path.replace(os.sep, "/")
+                rules_dir = final_path.rsplit("/", 1)[0]
+                backup_path = None
+
                 try:
-                    remote_path = f"{node.nginx_config_path}/waf_rules_auto.conf"
-                    backup_path = f"{remote_path}.backup.{int(datetime.now().timestamp())}"
-                    
-                    # Create backup of existing config
+                    self._ensure_remote_dir(ssh, rules_dir)
+
+                    sftp = ssh.open_sftp()
                     try:
-                        sftp.rename(remote_path, backup_path)
-                        logger.debug(f"Created backup: {backup_path}")
-                    except FileNotFoundError:
-                        backup_path = None  # No existing file to backup
-                    
-                    # Upload new configuration
-                    sftp.put(temp_config_path, remote_path)
-                    sftp.chmod(remote_path, 0o644)
-                    logger.debug(f"Uploaded configuration to {remote_path}")
-                    
-                finally:
-                    sftp.close()
-                
-                # Test configuration with real nginx validation
-                logger.debug(f"Testing nginx configuration on {node.node_id}")
-                nginx_test_result = self._test_nginx_config_on_node(ssh, node)
-                
-                if not nginx_test_result['success']:
-                    logger.error(f"Nginx config test failed on {node.node_id}: {nginx_test_result['error']}")
-                    # Rollback configuration
-                    if backup_path:
-                        self._rollback_config(ssh, node, backup_path, remote_path)
-                    return False
-                
-                # Reload nginx with validation
-                logger.debug(f"Reloading nginx on {node.node_id}")
-                reload_result = self._reload_nginx_with_validation(ssh, node)
-                
-                if not reload_result['success']:
-                    logger.error(f"Nginx reload failed on {node.node_id}: {reload_result['error']}")
-                    # Rollback configuration
-                    if backup_path:
-                        self._rollback_config(ssh, node, backup_path, remote_path)
-                    return False
-                
-                # Verify deployment success
-                verification_result = self._verify_deployment(ssh, node, nginx_config)
-                if verification_result['success']:
+                        # Back up the current active file, if any.
+                        try:
+                            backup_path = f"{final_path}.backup.{int(datetime.now().timestamp())}"
+                            sftp.rename(final_path, backup_path)
+                            logger.debug(f"Backed up current rules to {backup_path}")
+                        except (IOError, OSError) as exc:
+                            # First deploy: nothing to back up. paramiko raises
+                            # IOError(ENOENT), which IS a FileNotFoundError, but
+                            # both are caught so the intent survives any transport.
+                            backup_path = None
+                            logger.debug(f"No existing rules to back up ({exc})")
+
+                        # Place the candidate so that `nginx -t` really parses it.
+                        sftp.put(temp_config_path, final_path)
+                        sftp.chmod(final_path, 0o644)
+                        logger.debug(f"Placed candidate at {final_path} for validation")
+
+                    finally:
+                        sftp.close()
+
+                    # Validate the COMPLETE candidate with the real nginx test.
+                    logger.debug(f"Testing nginx configuration on {node.node_id}")
+                    nginx_test_result = self._test_nginx_config_on_node(ssh, node)
+
+                    if not nginx_test_result['success']:
+                        error_output = nginx_test_result.get('error', 'unknown error')
+                        logger.error(
+                            f"REJECTED: candidate for {node.node_id} failed validation: "
+                            f"{error_output}"
+                        )
+                        return False
+
+                    # Reload nginx with validation
+                    logger.debug(f"Reloading nginx on {node.node_id}")
+                    reload_result = self._reload_nginx_with_validation(ssh, node)
+
+                    if not reload_result['success']:
+                        logger.error(
+                            f"Nginx reload failed on {node.node_id}: {reload_result['error']}"
+                        )
+                        return False
+
+                    # Verify the rules are ACTUALLY LOADED, not merely on disk.
+                    verification_result = self._verify_deployment(ssh, node, nginx_config)
+                    if not verification_result['success']:
+                        logger.error(
+                            f"Deployment verification failed on {node.node_id}: "
+                            f"{verification_result['error']}"
+                        )
+                        return False
+
                     deployed_successfully = True
-                    logger.info(f"Successfully deployed and verified configuration on {node.node_id}")
-                    
-                    # Clean up old backups (keep last 5)
-                    self._cleanup_old_backups(ssh, node, remote_path)
+                    logger.info(
+                        f"Deployed and verified ACTIVE on {node.node_id}: "
+                        f"{verification_result.get('message', '')}"
+                    )
+                    self._cleanup_old_backups(ssh, node, final_path)
                     return True
-                else:
-                    logger.error(f"Deployment verification failed on {node.node_id}: {verification_result['error']}")
-                    if backup_path:
-                        self._rollback_config(ssh, node, backup_path, remote_path)
-                    return False
+
+                finally:
+                    # Restore the previous state if we did not finish successfully.
+                    # This runs on EVERY exit path, including exceptions, so an
+                    # invalid or half-applied candidate can never be left behind.
+                    if not deployed_successfully:
+                        self._restore_previous_config(
+                            ssh, node, final_path, backup_path
+                        )
 
             finally:
                 # Clean up temporary config file
@@ -714,30 +840,161 @@ class NginxManager:
             return {'success': False, 'error': f"Failed to reload nginx: {str(e)}"}
 
     def _verify_deployment(self, ssh, node: NginxNode, expected_config: str) -> Dict[str, any]:
-        """Verify deployment was successful"""
+        """
+        Verify the expected rules are LOADED, and loaded FROM OUR FILE.
+
+        Two weaknesses this closes:
+
+        1. The previous implementation ran `cat` on the rule file and compared the
+           text with what was uploaded. That proves the file was written -
+           "staged" - and it reported that as a successful deployment. The question
+           that matters is whether nginx is SERVING the rules, so this uses
+           `nginx -T`, which dumps the configuration as loaded.
+
+        2. Searching the WHOLE dump is not enough either. The generator emits
+           `limit_req zone=waf_dynamic burst=5 nodelay;`, and the node's own
+           dynamic-<node>.conf already contains that exact line, so a
+           rate-limit-only batch would "verify" as active even if our file did not
+           exist. `nginx -T` labels each section with
+           `# configuration file <path>:`, so the expected directives are checked
+           only within OUR file's section.
+
+        It also no longer accepts a match on any single line: every expected
+        directive must be present.
+        """
         try:
-            # Check if configuration file exists and has correct content
-            remote_path = f"{node.nginx_config_path}/waf_rules_auto.conf"
-            stdin, stdout, stderr = ssh.exec_command(f"cat {remote_path}", timeout=30)
+            stdin, stdout, stderr = ssh.exec_command("nginx -T", timeout=30)
             exit_code = stdout.channel.recv_exit_status()
-            
+
             if exit_code != 0:
-                return {'success': False, 'error': 'Configuration file not found after deployment'}
-            
-            deployed_config = stdout.read().decode().strip()
-            expected_config_lines = set(line.strip() for line in expected_config.split('\n') if line.strip())
-            deployed_config_lines = set(line.strip() for line in deployed_config.split('\n') if line.strip())
-            
-            # Check if core rules are present (allow for minor formatting differences)
-            core_rules_present = len(expected_config_lines.intersection(deployed_config_lines)) > 0
-            
-            if core_rules_present:
-                return {'success': True, 'message': 'Deployment verified'}
-            else:
-                return {'success': False, 'error': 'Deployed configuration differs from expected'}
-                
+                return {
+                    'success': False,
+                    'error': 'nginx -T failed; cannot confirm the loaded configuration'
+                }
+
+            dump = stdout.read().decode()
+            # Our file is the one for this node's own directory.
+            our_file = f"/etc/nginx/waf-rules/agent-{node.node_id}/rules.conf"
+            section = self._extract_loaded_section(dump, our_file)
+
+            if section is None:
+                return {
+                    'success': False,
+                    'error': (
+                        f"{our_file} does not appear in the loaded configuration, "
+                        f"so none of its rules are in force"
+                    )
+                }
+
+            expected_lines = [
+                line.strip() for line in expected_config.split('\n')
+                if line.strip() and not line.strip().startswith('#')
+            ]
+            if not expected_lines:
+                return {
+                    'success': False,
+                    'error': 'No expected directives to verify'
+                }
+
+            missing = [line for line in expected_lines if line not in section]
+
+            if missing:
+                return {
+                    'success': False,
+                    'error': (
+                        f'{len(missing)} of {len(expected_lines)} expected directives '
+                        f'are NOT loaded from {our_file} (first: {missing[0]})'
+                    )
+                }
+
+            return {
+                'success': True,
+                'message': (
+                    f'All {len(expected_lines)} expected directives are loaded '
+                    f'from {our_file}'
+                )
+            }
+
         except Exception as e:
             return {'success': False, 'error': f"Failed to verify deployment: {str(e)}"}
+
+    @staticmethod
+    def _extract_loaded_section(dump: str, path: str):
+        """
+        Return the part of an `nginx -T` dump that came from `path`, or None.
+
+        `nginx -T` prefixes each included file's contents with a line of the form
+        `# configuration file <path>:`. The section runs until the next such
+        marker.
+        """
+        marker = f"# configuration file {path}:"
+        start = dump.find(marker)
+        if start == -1:
+            return None
+
+        body_start = start + len(marker)
+        next_marker = dump.find("# configuration file ", body_start)
+        if next_marker == -1:
+            return dump[body_start:]
+        return dump[body_start:next_marker]
+
+    def _ensure_remote_dir(self, ssh, remote_dir: str):
+        """Create a remote directory if it does not exist (idempotent)."""
+        stdin, stdout, stderr = ssh.exec_command(f"mkdir -p {remote_dir}", timeout=30)
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            error_output = stderr.read().decode().strip()
+            raise IOError(f"Could not create {remote_dir}: {error_output}")
+
+    def _restore_previous_config(self, ssh, node: NginxNode, final_path: str, backup_path):
+        """
+        Put the node back the way it was after a failed deployment.
+
+        This is the safety net that makes a FIRST deploy safe. Previously the
+        rollback was guarded by `if backup_path:` and a first deploy has no backup,
+        so a rejected candidate stayed in the live include path and every later
+        `nginx -t` on that node failed - leaving it unable to reload or restart.
+        That is the same outage class the product exists to prevent.
+
+        Two cases:
+          - There was a previous file: rename the backup over the candidate.
+          - There was not: remove the candidate, so the node returns to having no
+            agent rules (which is a valid state, because the vhost include is a
+            wildcard over a per-node directory).
+        """
+        try:
+            sftp = ssh.open_sftp()
+            try:
+                if backup_path:
+                    # paramiko documents standard RENAME as requiring the target
+                    # not to exist, so remove the candidate first, then rename.
+                    try:
+                        sftp.remove(final_path)
+                    except (IOError, OSError):
+                        pass  # Already gone; nothing to remove.
+                    sftp.rename(backup_path, final_path)
+                    logger.info(
+                        f"Restored previous rules on {node.node_id} from {backup_path}"
+                    )
+                else:
+                    try:
+                        sftp.remove(final_path)
+                        logger.info(
+                            f"Removed rejected candidate from {node.node_id}; "
+                            f"the node has no agent rules, which is a valid state"
+                        )
+                    except (IOError, OSError) as exc:
+                        logger.warning(
+                            f"Could not remove candidate {final_path}: {exc}"
+                        )
+            finally:
+                sftp.close()
+        except Exception as e:
+            # Never let the safety net itself raise over the real failure.
+            logger.error(
+                f"COULD NOT RESTORE {node.node_id} after a failed deployment: {e}. "
+                f"{final_path} may need manual attention."
+            )
 
     def _rollback_config(self, ssh, node: NginxNode, backup_path: str, current_path: str):
         """Rollback configuration to previous version"""
