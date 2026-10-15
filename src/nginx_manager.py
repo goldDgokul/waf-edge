@@ -9,6 +9,7 @@ import asyncio
 import httpx
 import paramiko
 import os
+import re
 from datetime import datetime
 from typing import List, Dict, Optional
 from dataclasses import dataclass
@@ -34,13 +35,80 @@ from pathlib import Path
 # configured per deployment.
 SHARED_WAF_DIR = os.getenv("WAF_SHARED_RULES_DIR", "/app/waf-rules")
 
+# Where the rules live on a REMOTE node reached over SSH. A separate constant from
+# SHARED_WAF_DIR because the same directory is reached by different routes: the API
+# container sees it as /app/waf-rules, the node sees it as /etc/nginx/waf-rules. One
+# destination SHAPE, two roots.
+REMOTE_WAF_RULES_DIR = "/etc/nginx/waf-rules"
+
+# A node id becomes a DIRECTORY NAME in the rules include, so anything outside
+# this set would either escape the rules root or produce a directory the vhost's
+# `include .../agent-<node>/*.conf` cannot match - a rule file nginx never reads,
+# which is the "success while protecting nothing" failure this module exists to
+# prevent. The API validates node_id on the add-node path (SecureNginxNodeModel),
+# but rules identity must NOT depend on a caller having gone through that model:
+# nodes can also arrive from configuration and from the environment.
+_NODE_ID_MAX_LENGTH = 64
+_NODE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def validate_node_id(node_id: str) -> str:
+    """
+    Return node_id unchanged if it is safe to use as a directory name, else raise.
+
+    Raising rather than sanitising is deliberate. A mangled id would still produce
+    a path, and that path would be a DIFFERENT node's directory - so a deployment
+    could report success while writing rules into another tenant's file. There is
+    no safe rewrite of an invalid identity, so the operation must refuse.
+    """
+    if not isinstance(node_id, str) or not node_id:
+        raise ValueError("node_id must be a non-empty string")
+    if len(node_id) > _NODE_ID_MAX_LENGTH:
+        raise ValueError(
+            f"node_id is {len(node_id)} characters; the limit is {_NODE_ID_MAX_LENGTH}"
+        )
+    if not _NODE_ID_PATTERN.fullmatch(node_id):
+        raise ValueError(
+            f"node_id {node_id!r} is not usable as a directory name. It must start "
+            f"with a letter or digit and contain only letters, digits, dot, "
+            f"underscore or hyphen - otherwise it cannot appear in the vhost's "
+            f"include path and its rules would never be loaded."
+        )
+    if os.sep in node_id or "/" in node_id or "\\" in node_id or ".." in node_id:
+        raise ValueError(
+            f"node_id {node_id!r} contains a path separator or traversal sequence"
+        )
+    return node_id
+
+
+def remote_rule_destination(node_id: str) -> str:
+    """
+    The destination as a POSIX path for a remote node.
+
+    Same shape as rule_destination_for(), but with forward slashes guaranteed.
+    os.path.join() uses the LOCAL separator, so on Windows it would produce
+    `agent-node_1\\rules.conf` - harmless when writing to a share, wrong when the
+    string is compared against a path inside an `nginx -T` dump from Linux.
+    """
+    return "/".join(rule_destination_for(node_id).split(os.sep))
+
+
 
 def rule_destination_for(node_id: str) -> str:
     """
     The ONE destination for a node's generated rules, relative to the rules root.
 
-    EVERY transport builds its path from this function, so the two can never
-    disagree about where rules live.
+    EVERY part of the deployment code that needs to know where a node's rules live
+    builds the path from here: the file transport, the SSH transport, and the
+    verifier that checks the rules were loaded. A hardcoded path in one of them was
+    how a second, independent definition of the same fact survived - and it was
+    only ever going to be found by a change that moved the file and left the
+    verifier searching for the old name.
+
+    (The verifier previously built its own f-string. It happened to match, and a
+    mismatch would have failed safe by reporting failure rather than success - but
+    two definitions of one fact is the shape of the defect this change removes, so
+    the verifier now calls through the helpers below like everything else.)
 
     WHAT ACTUALLY HAPPENED, so nobody re-derives a wrong fix (corrected
     2026-10-15 after an independent review falsified an earlier version of this
@@ -73,7 +141,7 @@ def rule_destination_for(node_id: str) -> str:
     sees it as /etc/nginx/waf-rules, and the SSH transport reaches the remote
     copy. Each joins this to its own root.
     """
-    return os.path.join(f"agent-{node_id}", "rules.conf")
+    return os.path.join(f"agent-{validate_node_id(node_id)}", "rules.conf")
 
 
 
@@ -687,17 +755,10 @@ class NginxManager:
                 # defaults to /etc/nginx/conf.d, included at http scope, and the
                 # generated rules contain `if`, legal only in server/location.
                 # Writing there reproduces the 0A.1 outage.
-                # One destination rule for both transports. rule_destination_for()
-                # returns "agent-<node>/rules.conf", so this path and the file
-                # path can never disagree again - which is how the duplicate
-                # directive defect happened.
-                REMOTE_RULES_ROOT = "/etc/nginx/waf-rules"
-                final_path = os.path.join(
-                    REMOTE_RULES_ROOT, rule_destination_for(node.node_id)
-                )
-                # os.path.join uses the local separator; on the remote (POSIX) it
-                # must be a forward slash.
-                final_path = final_path.replace(os.sep, "/")
+                # One destination rule for every transport. Built from the same
+                # helper the file transport and the verifier use, in POSIX form, so
+                # no two parts of the code can disagree about where rules live.
+                final_path = f"{REMOTE_WAF_RULES_DIR}/{remote_rule_destination(node.node_id)}"
                 rules_dir = final_path.rsplit("/", 1)[0]
                 backup_path = None
 
@@ -874,7 +935,15 @@ class NginxManager:
 
             dump = stdout.read().decode()
             # Our file is the one for this node's own directory.
-            our_file = f"/etc/nginx/waf-rules/agent-{node.node_id}/rules.conf"
+            #
+            # Built from the same helper every other transport uses, so a change to
+            # the destination shape cannot leave verification looking for a path
+            # that no longer exists. Previously this was a hardcoded f-string - it
+            # happened to match, but it was a second, independent definition of the
+            # same fact, which is the shape of the defect this whole change removes.
+            # (It failed safe: a mismatch reports failure rather than success. But
+            # "fails safe" is not the same as "consistent".)
+            our_file = f"{REMOTE_WAF_RULES_DIR}/{remote_rule_destination(node.node_id)}"
             section = self._extract_loaded_section(dump, our_file)
 
             if section is None:
