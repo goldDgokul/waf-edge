@@ -1526,7 +1526,33 @@ async def deploy_rules(
             #
             # The parameter is now honoured, and an unknown node id is REFUSED rather
             # than silently dropped - a typo in a node id must not look like success.
-            if request.node_ids:
+            # EMPTY LIST IS NOT "NOT GIVEN" - and treating it as such changes every node.
+            #
+            # This read `if request.node_ids:`. In Python an empty list is FALSY, so a
+            # caller sending node_ids=[] - "target nothing", or a defensively empty
+            # list - fell through to the else branch and had rules deployed to EVERY
+            # node, with a success report. Found by an independent review of b47fac7,
+            # 2026-10-16, and reproduced:
+            #     bool([])        -> False   -> all-nodes branch
+            #     bool(['node_1']) -> True   -> selective branch
+            # The validator in src/validation.py does NOT catch it either: it iterates
+            # the list to check each id's format, so an empty list has nothing to check
+            # and passes through.
+            #
+            # The distinction the code needs is "was the parameter SUPPLIED", not
+            # "is it truthy". `is not None` says that. An explicitly empty list is then
+            # refused rather than silently widened: a request to deploy to no node is
+            # either a mistake or a deliberate no-op, and neither should touch a fleet.
+            if request.node_ids is not None:
+                if not request.node_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "node_ids was supplied but empty. This would target no "
+                            "node, so it is refused rather than silently widened to "
+                            "every node. Omit node_ids entirely to target all nodes."
+                        ),
+                    )
                 deployment_results = await nginx_manager.deploy_rules_to_specific_nodes(
                     request.node_ids, nginx_config
                 )
@@ -1556,6 +1582,35 @@ async def deploy_rules(
             failed_deployments = [
                 node_id for node_id, success in deployment_results.items() if not success
             ]
+
+            # NOTHING DEPLOYED IS NOT SUCCESS - the vacuous-truth hole.
+            #
+            # Found by an independent review of b47fac7, 2026-10-16, and reproduced:
+            # with an empty node set, deploy_rules_to_all_nodes() returns {}, so
+            # `failed_deployments` is [] and the check below does not fire. The endpoint
+            # then returns 200 "Rules deployed and confirmed active on all nodes" over
+            # ZERO nodes - the strongest possible claim about the weakest possible set.
+            #
+            # This is unreachable in the current compose config (the manager is built
+            # with at least one node, and an empty node_ids list is now refused above),
+            # so it is NOT live. It is fixed anyway because "unreachable" is not
+            # "absent": remove a node at runtime, or build the manager differently, and
+            # this silently becomes the most dishonest response the API can give. A
+            # previous review found this exact shape once, which is why it is fixed
+            # rather than noted.
+            if not deployment_results:
+                logger.error(
+                    "Deployment targeted NO nodes: nothing was attempted. This is not "
+                    "a success."
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "No node was targeted, so nothing was deployed. This is not a "
+                        "success: rules are protecting no traffic."
+                    ),
+                )
+
             if failed_deployments:
                 active_nodes = [
                     node_id for node_id, success in deployment_results.items() if success

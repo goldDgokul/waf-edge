@@ -7,6 +7,7 @@ Enhanced security with encrypted SSH key support and comprehensive error handlin
 
 import asyncio
 import httpx
+import itertools
 import paramiko
 import os
 import re
@@ -153,11 +154,27 @@ def staging_destination_for(node_id: str) -> str:
     )
 
 
+# Serial number for unique temporary filenames during a stage-then-rename.
+#
+# WHY A MODULE-LEVEL COUNTER: the previous attempt used os.getpid() and
+# threading.get_ident(), which are IDENTICAL for every asyncio task in the process -
+# so two concurrent deployments to one node produced the same temporary path and one
+# of them was silently lost. Measured 2026-10-16 by an independent review.
+# itertools.count() is atomic enough for this purpose under CPython and shared by
+# every caller, which is what makes the name unique per ATTEMPT rather than per process.
+_TMP_SERIAL = itertools.count()
+
+
+def _next_tmp_serial():
+    """The next unique serial for a temporary filename. See _TMP_SERIAL above."""
+    return _TMP_SERIAL
+
+
 # How long an unvalidated candidate may sit in staging before it is swept.
 #
 # WHY THIS EXISTS (found by an independent review, 2026-10-16): the staging path is
 # one FIXED filename per node, so a new deploy overwrites the previous candidate -
-# but nothing ever removed them, and `_staging` is on the shared volume the nodes
+# but nothing ever removed the file, and `_staging` is on the shared volume the nodes
 # mount. Left alone it accumulates one directory per node forever, and stale
 # candidates are a hazard of their own: a later promotion step, or an operator
 # copying "the staged file", could pick up a candidate from days ago.
@@ -838,7 +855,26 @@ class NginxManager:
             #
             # A UNIQUE name per attempt: a fixed name means two concurrent deploys
             # to the same node overwrite each other's candidate.
-            tmp_file = f"{staged_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+            # A UNIQUE NAME PER ATTEMPT, AND IT HAS TO BE GENUINELY UNIQUE.
+            #
+            # This was `f"{staged_file}.{os.getpid()}.{threading.get_ident()}.tmp"`, and
+            # the comment above claimed "a UNIQUE name per attempt". Both halves of that
+            # were wrong, found by an independent review of b77d71c, 2026-10-16:
+            #
+            #   - the name was NOT unique. Every asyncio task runs on ONE thread in ONE
+            #     process, so two concurrent deploys to the same node generated the SAME
+            #     tmp path. Reproduced: two concurrent _deploy_via_file calls for the
+            #     same node produced staged content containing only ONE of the two
+            #     payloads - the other deployment's rules were silently lost, and both
+            #     callers were told the same thing. Not a TORN file (the rename is
+            #     atomic) but a LOST UPDATE, which is the same class of wrong: a
+            #     component reporting an outcome it did not achieve.
+            #   - itertools.count() rather than uuid4() is deliberate: uniqueness is
+            #     what is needed here, not unpredictability. A counter is cheap,
+            #     dependency-free and readable in a directory listing.
+            #   - the pid is kept only as a debugging aid. It is NOT the uniqueness
+            #     mechanism, and must not be mistaken for one again.
+            tmp_file = f"{staged_file}.{os.getpid()}.{next(_next_tmp_serial())}.tmp"
             try:
                 with open(tmp_file, "w") as f:
                     f.write(f"# WAF rules for {node.node_id}\n")
