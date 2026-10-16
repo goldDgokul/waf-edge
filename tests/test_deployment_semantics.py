@@ -182,3 +182,56 @@ def test_no_unreachable_code_after_ssh_deploy_sync():
         "a duplicated, unreachable deployment block is present in "
         "_ssh_deploy_sync - it was deleted in 0A.2 and must not come back"
     )
+
+
+# -----------------------------------------------------------------------------
+# A2 (review finding): restoring the file must RELOAD, so the running workers
+# drop the unverified candidate. Pre-fix, _restore_previous_config restored the
+# file on disk but never reloaded, so on the reload-success/verify-failure path
+# the old workers kept enforcing a rejected rule.
+# -----------------------------------------------------------------------------
+
+def test_restore_previous_config_reloads_the_node():
+    """
+    Restoring the previous configuration must reload nginx afterwards.
+
+    RED before the fix: _restore_previous_config renamed the backup back onto the
+    live path and then returned, leaving nginx serving the (unverified) candidate
+    it had already loaded. The fix calls _reload_nginx_with_validation after the
+    restore, so on-disk state and serving state agree.
+    """
+    from unittest.mock import MagicMock
+
+    manager = NginxManager([])
+    node = _node()
+
+    fake_sftp = MagicMock()
+    fake_ssh = MagicMock()
+    fake_ssh.open_sftp.return_value = fake_sftp
+
+    manager._reload_nginx_with_validation = MagicMock(
+        return_value={"success": True}
+    )
+
+    manager._restore_previous_config(
+        fake_ssh,
+        node,
+        "/etc/nginx/waf-rules/agent-node_1/rules.conf",
+        "/etc/nginx/waf-rules/agent-node_1/rules.conf.backup.1",
+    )
+
+    manager._reload_nginx_with_validation.assert_called_once_with(fake_ssh, node)
+
+
+def test_dead_rollback_config_method_is_deleted():
+    """
+    `_rollback_config` was a wrong duplicate of `_restore_previous_config`: it did
+    `sftp.rename(backup, current)` without removing `current` first, but paramiko's
+    standard RENAME requires the target NOT to exist, so it would raise on a real
+    rollback. It had zero callers. It must stay deleted.
+    """
+    assert not hasattr(NginxManager, "_rollback_config"), (
+        "_rollback_config was a wrong duplicate of _restore_previous_config "
+        "(rename-without-remove on a paramiko RENAME) with zero callers. Deleted "
+        "2026-10-16; it must not come back."
+    )

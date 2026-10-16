@@ -66,6 +66,14 @@ data/*.json
 docker/shared/waf-rules/dynamic-*.conf
 docker/shared/waf-rules/agent-*/
 
+# 0A.13 dev SSH keypair (see docker/nginx-node-1/ssh/).
+# The PRIVATE key is a local secret and must never be committed; the PUBLIC key
+# is committed as authorized_keys so the node image builds reproducibly.
+# id_ed25519.pub is a byproduct of generate_keys.sh and is redundant with
+# authorized_keys, so both generated key files are ignored.
+docker/nginx-node-1/ssh/id_ed25519
+docker/nginx-node-1/ssh/id_ed25519.pub
+
 # Environment
 .env
 .env.local

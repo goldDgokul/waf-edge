@@ -248,6 +248,14 @@ Main configuration is in `config/waf_ai_config.json`. Example nginx node configu
 
 ### Step 1: Start services
 
+The SSH activation node (0A.13) needs a local keypair before the first `up`:
+the compose bind-mount for the key source fails if it is absent. Generate it
+once (the private key is gitignored; only the public key is committed):
+
+```bash
+sh docker/nginx-node-1/ssh/generate_keys.sh
+```
+
 ```bash
 docker-compose up -d
 curl http://localhost:8000/health

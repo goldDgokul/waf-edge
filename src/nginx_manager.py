@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 from typing import List, Dict, Optional
 from dataclasses import dataclass
-from .error_handling import retry, error_recovery, CircuitBreakerConfig
+from .error_handling import error_recovery, CircuitBreakerConfig
 from datetime import datetime
 import json
 import tempfile
@@ -403,10 +403,15 @@ class NginxManager:
                 return {node_id: False for node_id in self.nodes.keys()}
             
             # Deploy to all nodes in parallel with timeout
+            # The timeout must exceed the sum of the SSH chain's internal timeouts
+            # (connect 30s + nginx -t 30s + reload 30s + verify 30s + margin).
+            # asyncio.wait_for cancels the AWAIT, not the executor thread, so a
+            # too-short bound reports failure while the thread can still activate
+            # rules afterwards - a deployment reported failed that later succeeds.
             tasks = [
                 asyncio.wait_for(
                     self._deploy_to_node(node, nginx_config),
-                    timeout=30.0
+                    timeout=120.0
                 )
                 for node in self.nodes.values()
             ]
@@ -508,7 +513,7 @@ class NginxManager:
             deployment_results: Dict[str, bool] = {}
             tasks = [
                 asyncio.wait_for(
-                    self._deploy_to_node(node, nginx_config), timeout=30.0
+                    self._deploy_to_node(node, nginx_config), timeout=120.0
                 )
                 for node in unique_targets
             ]
@@ -971,7 +976,6 @@ class NginxManager:
             logger.error(f"SSH deployment failed for {node.node_id}: {e}")
             return False
     
-    @retry(max_attempts=2, backoff_strategy="fixed", base_delay=2.0)
     def _ssh_deploy_sync(self, node: NginxNode, nginx_config: str) -> bool:
         """Synchronous SSH deployment with enhanced validation and rollback"""
         ssh = None
@@ -1195,6 +1199,14 @@ class NginxManager:
         """
         Verify the expected rules are LOADED, and loaded FROM OUR FILE.
 
+        SCOPE, STATED HONESTLY: this proves the rules are PARSED and INCLUDED
+        (present in `nginx -T` output, section-scoped to our file), NOT that the
+        live serving workers are ENFORCING them. A worker crash-loop between
+        reload and serving would still read as "active" here. The live-403
+        confirmation lives in the acceptance test (tests/test_ssh_activation.py),
+        which polls the node's HTTP response after reload. This is a residual
+        0A.3 weakness, recorded rather than hidden.
+
         Two weaknesses this closes:
 
         1. The previous implementation ran `cat` on the rule file and compared the
@@ -1363,39 +1375,26 @@ class NginxManager:
                         )
             finally:
                 sftp.close()
+
+            # After restoring the file, RELOAD so the running workers serve the
+            # restored (last-known-good) configuration. Without this, on the
+            # reload-success/verify-failure path nginx has ALREADY loaded the
+            # candidate, and the old workers keep enforcing it until some later,
+            # unrelated reload - a rejected rule left in force. Reloading here
+            # makes the on-disk state and the serving state agree.
+            reload_result = self._reload_nginx_with_validation(ssh, node)
+            if not reload_result['success']:
+                logger.error(
+                    f"Restored file on {node.node_id} but reload failed: "
+                    f"{reload_result['error']}. The restored rules are on disk "
+                    f"but not yet serving."
+                )
         except Exception as e:
             # Never let the safety net itself raise over the real failure.
             logger.error(
                 f"COULD NOT RESTORE {node.node_id} after a failed deployment: {e}. "
                 f"{final_path} may need manual attention."
             )
-
-    def _rollback_config(self, ssh, node: NginxNode, backup_path: str, current_path: str):
-        """Rollback configuration to previous version"""
-        try:
-            logger.warning(f"Rolling back configuration on {node.node_id}")
-            
-            # Restore backup
-            sftp = ssh.open_sftp()
-            try:
-                sftp.rename(backup_path, current_path)
-                logger.info(f"Restored backup from {backup_path}")
-            finally:
-                sftp.close()
-            
-            # Test and reload with backup
-            test_result = self._test_nginx_config_on_node(ssh, node)
-            if test_result['success']:
-                reload_result = self._reload_nginx_with_validation(ssh, node)
-                if reload_result['success']:
-                    logger.info(f"Successfully rolled back configuration on {node.node_id}")
-                else:
-                    logger.error(f"Failed to reload after rollback on {node.node_id}: {reload_result['error']}")
-            else:
-                logger.error(f"Backup configuration also invalid on {node.node_id}: {test_result['error']}")
-                
-        except Exception as e:
-            logger.error(f"Failed to rollback configuration on {node.node_id}: {e}")
 
     def _cleanup_old_backups(self, ssh, node: NginxNode, config_path: str):
         """Clean up old backup files, keeping only the last 5"""
