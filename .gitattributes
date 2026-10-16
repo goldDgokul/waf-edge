@@ -1,0 +1,12 @@
+# Line-ending discipline for files whose contents must never gain CRLF.
+#
+# core.autocrlf=true (the Windows default) converts LF->CRLF on checkout. For a
+# shell script, that breaks the shebang: the kernel reads "#!/bin/sh\r" and
+# cannot find the interpreter. The 0A.13 node entrypoint (docker/nginx-node-1/
+# entrypoint.sh) and generate_keys.sh must stay LF, or a fresh clone on Windows
+# builds a node image that crashes on start. Dockerfiles and the sshd_config are
+# pinned for the same reason: Docker/OpenSSH tolerate CRLF poorly.
+
+*.sh                 text eol=lf
+Dockerfile           text eol=lf
+ssh/sshd_config      text eol=lf
