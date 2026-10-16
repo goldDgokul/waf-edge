@@ -133,9 +133,25 @@ def test_file_transport_never_claims_activation(tmp_path, monkeypatch):
 
 def test_file_transport_writes_where_the_vhost_looks(tmp_path, monkeypatch):
     """
-    BEHAVIOURAL. What the transport writes must be something the vhost include
-    can actually load - otherwise the write is invisible to nginx and the rules
-    protect nothing.
+    BEHAVIOURAL, AND ITS CLAIM WAS REVERSED ON 2026-10-16.
+
+    WHAT IT USED TO ASSERT, and why that was a defect in the test rather than a
+    property of the code: it required the file transport to produce
+    `agent-node_1/rules.conf` - i.e. it demanded that the transport write its output
+    into the directory the vhost includes, and treated that as the passing
+    condition. But the transport performs NO validation, so satisfying this test
+    meant parking an unvalidated file exactly where nginx would load it on the next
+    legitimate reload. That is the original outage class this workstream exists to
+    prevent (`[emerg] "if" directive is not allowed here in dynamic-node_1.conf:9`).
+
+    The test was therefore guarding the bug. It passed against the broken code and
+    would have failed against the fix - the clearest possible sign that its
+    assertion encoded the defect.
+
+    WHAT IT ASSERTS NOW: the candidate lands SOMEWHERE under the rules root (so the
+    work is not lost), and NOT at any path the include can match (so an unvalidated
+    directive cannot reach a running nginx). Both halves matter: a transport that
+    wrote nothing at all would pass the second half while being useless.
     """
     node = _make_node("node_1")
     _run_file_transport(tmp_path, monkeypatch, node)
@@ -146,20 +162,33 @@ def test_file_transport_writes_where_the_vhost_looks(tmp_path, monkeypatch):
         f"{sorted(p.name for p in tmp_path.rglob('*'))}"
     )
 
-    # The vhost include is `agent-node_1/*.conf`. The final file must live there
-    # and end in .conf, or nginx never loads it.
-    loaded = [p for p in all_files if p.name == "rules.conf" and p.parent.name == "agent-node_1"]
-    assert loaded, (
-        "the file transport did not produce agent-node_1/rules.conf, the only path "
-        f"the vhost include loads. It wrote: "
+    # HALF 1 - something was staged. The candidate must not simply vanish.
+    assert any(p.name == "rules.conf.pending" for p in all_files), (
+        "the transport wrote no staged candidate. It wrote: "
         f"{[str(p.relative_to(tmp_path)) for p in all_files]}."
     )
 
-    # No leftover temporary file: a torn or abandoned candidate in the rules
-    # directory is a hazard if the include or a backup ever picks it up.
-    leftovers = [p.name for p in all_files if p.name != "rules.conf"]
+    # HALF 2 - THE SAFETY PROPERTY. Nothing matching the vhost include
+    # `agent-<node>/*.conf` may exist, because nothing here has been validated.
+    # Written as a real glob rather than a name comparison, so it fails if someone
+    # later stages into a differently-named file that the glob still catches.
+    include_matches = sorted(
+        str(p.relative_to(tmp_path)) for p in tmp_path.rglob("agent-node_1/*.conf")
+    )
+    assert include_matches == [], (
+        "the file transport placed an UNVALIDATED candidate where the vhost include "
+        f"loads it: {include_matches}. This transport runs no `nginx -t`, so a file "
+        "there is loaded by the next legitimate reload and can take the node down - "
+        "the exact failure this workstream exists to prevent."
+    )
+
+    # HALF 3 - no torn leftovers from the tmp+rename dance.
+    leftovers = [
+        p.name for p in all_files
+        if p.name not in ("rules.conf.pending", "rules.conf")
+    ]
     assert not leftovers, (
-        f"the transport left extra files behind in the rules directory: {leftovers}"
+        f"the transport left a torn or abandoned temporary file behind: {leftovers}"
     )
 
 
@@ -180,7 +209,16 @@ def test_file_transport_does_not_produce_the_stale_name(tmp_path, monkeypatch):
     )
 
 
-HELPER_NAMES = {"rule_destination_for", "remote_rule_destination"}
+HELPER_NAMES = {
+    "rule_destination_for",
+    "remote_rule_destination",
+    # Added 2026-10-16 with the staging change. The file transport now derives its
+    # STAGED path from its own helper, and the guard must model that helper or it
+    # reports the new, correct code as a stray. Adding a name here is a statement
+    # that the helper is part of the sanctioned destination chain - not a way to
+    # silence the guard.
+    "staging_destination_for",
+}
 GUARDED_NAMES = ("rules_file", "staged_file", "final_path", "rules_dir", "our_file")
 
 
@@ -218,6 +256,21 @@ def destination_strays(source: str) -> list:
                     assignments.setdefault(tgt.id, []).append(n.value)
 
     def reaches_helper(node, seen=None) -> bool:
+        # A BARE ANNOTATION HAS NO VALUE, and this recursion must not assume one.
+        #
+        # Measured 2026-10-16: with `staged_file` newly guarded, the guard CRASHED
+        # with `AttributeError: 'NoneType' object has no attribute '_fields'`. The
+        # cause was not the new code but a latent bug here: the recursion follows
+        # every name mentioned in a guarded expression, reached the dataclass field
+        # declaration `node_id: str` (an AnnAssign whose .value is None), and called
+        # ast.walk(None). The guard had been passing only because the names it
+        # happened to traverse had values.
+        #
+        # A guard that crashes is a guard that is not running, so this is fixed
+        # rather than worked around: a declaration is skipped, and the guard's
+        # verdict is computed only from real assignments.
+        if node is None:
+            return False
         if called_helper(node):
             return True
         seen = seen or set()
@@ -408,3 +461,115 @@ def test_node_id_is_validated_before_it_becomes_a_directory():
     with pytest.raises(ValueError):
         nm.rule_destination_for("../evil")
 
+
+
+# ============================================================================
+# STAGING (0A.1(c)) - added 2026-10-16
+#
+# The file transport used to place an UNVALIDATED candidate at agent-<node>/
+# rules.conf, the exact path the vhost includes. It reported failure honestly, but
+# the file still became enforcing policy at the node's next legitimate reload. These
+# tests pin the corrected contract: unvalidated work is staged somewhere no include
+# can reach, and the live path is only for content that has passed a real nginx test.
+#
+# Each test below is written so that it FAILS against the pre-fix code. That is the
+# point of writing them at all: a test that passes before and after proves nothing.
+# ============================================================================
+
+
+def test_staging_path_can_never_be_matched_by_an_include():
+    """
+    The safety property, asserted on the helper itself rather than on a write.
+
+    Two ways staging could regress into danger, both checked:
+      (a) it stops being under a directory of its own (someone stages into
+          agent-<node>/ and relies on the extension);
+      (b) its filename ends in .conf, so an include wildcard or a future literal
+          include would pick it up.
+    """
+    staged = nm.staging_destination_for("node_1")
+
+    assert staged != nm.rule_destination_for("node_1"), (
+        "the staging path and the live path are the same, so an unvalidated "
+        "candidate is written where nginx loads it - the defect 0A.1(c) removed"
+    )
+
+    # (b) - the basename must not look like an nginx config file.
+    basename = staged.replace("\\", "/").rsplit("/", 1)[-1]
+    assert not basename.endswith(".conf"), (
+        f"the staged candidate is named {basename!r}, which ends in .conf, so any "
+        f"include glob the vhost grows later could load an unvalidated file"
+    )
+
+    # (a) - it must not sit inside the per-node include directory. Asserted with a
+    # real glob over a real directory, not by string comparison, so the test fails
+    # if the layout changes underneath it.
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / staged
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("if ($a) { return 403; }\n", encoding="utf-8")
+
+        matched = sorted(
+            str(p.relative_to(td)) for p in Path(td).rglob("agent-node_1/*.conf")
+        )
+        assert matched == [], (
+            f"a staged candidate landed where the vhost include loads it: {matched}"
+        )
+
+
+def test_node_id_validation_still_runs_on_the_staging_path():
+    """
+    Moving the write must not move it out from under validation.
+
+    A traversal id would escape the rules root in EITHER direction, so the check has
+    to be on the path actually used. This fails if someone later builds the staging
+    path by string concatenation instead of calling the helper.
+    """
+    for bad in ["../evil", "node/1", "node_1\n"]:
+        with pytest.raises(ValueError):
+            nm.staging_destination_for(bad)
+
+
+def test_staging_guard_is_wired_into_the_file_transport(tmp_path, monkeypatch):
+    """
+    The guard must be CALLED, not merely defined.
+
+    Deletes nothing - it drives the real transport and then asserts the live path is
+    empty while the staging path is not. This is the behavioural form: a defined-but
+    -unused helper would leave the live path populated and fail here.
+    """
+    node = _make_node("node_1")
+    _run_file_transport(tmp_path, monkeypatch, node)
+
+    live = list(tmp_path.rglob("agent-node_1/*.conf"))
+    staged = [p for p in tmp_path.rglob("*") if p.is_file() and p.name.endswith(".pending")]
+
+    assert staged, (
+        "the transport staged nothing at all. If _deploy_via_file stopped calling "
+        "staging_destination_for(), the candidate would go to the live path instead "
+        "and this assertion is what notices."
+    )
+    assert live == [], (
+        f"the transport wrote to the include-matched live path: "
+        f"{[str(p.relative_to(tmp_path)) for p in live]}"
+    )
+
+
+def test_file_transport_still_reports_failure_while_staging(tmp_path, monkeypatch):
+    """
+    Staging is not activation, and the report must keep saying so.
+
+    Guarding the honest half too: a change that made the transport return True
+    because 'the file is written' would be the false-success defect again, just
+    relocated.
+    """
+    node = _make_node("node_1")
+    monkeypatch.setattr(nm, "SHARED_WAF_DIR", str(tmp_path))
+    manager = NginxManager([node])
+    result = asyncio.run(manager._deploy_via_file(node, "if ($a) { return 403; }\n"))
+    assert result is False, (
+        "the file transport claimed success. It cannot validate or reload nginx, so "
+        "there is no state it could have established that would justify True."
+    )

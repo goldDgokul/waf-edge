@@ -49,6 +49,16 @@ class _FakeManagerPartialFailure:
     async def deploy_rules_to_all_nodes(self, config):
         return {"node_1": True, "node_2": False}
 
+    # Added 2026-10-16. The endpoint now honours request.node_ids via a separate
+    # method, so a fake manager must provide it. The request under test names BOTH
+    # nodes, so the selective path must reproduce the SAME partial result as the
+    # all-nodes path - otherwise this test would assert the routing rather than the
+    # reporting behaviour it was written for.
+    async def deploy_rules_to_specific_nodes(self, node_ids, config):
+        all_results = {"node_1": True, "node_2": False}
+        # Mirror the real method's contract: every requested id is answered.
+        return {nid: all_results.get(nid, False) for nid in node_ids}
+
 
 class _FakeGenerator:
     def get_active_rules(self):
@@ -149,6 +159,11 @@ class _FakeManagerAllOk:
 
     async def deploy_rules_to_all_nodes(self, config):
         return {"node_1": True, "node_2": True}
+
+    # Added 2026-10-16, see _FakeManagerPartialFailure above. The request names both
+    # nodes, so the selective path answers both, truthfully.
+    async def deploy_rules_to_specific_nodes(self, node_ids, config):
+        return {nid: True for nid in node_ids}
 
 
 def test_full_success_is_still_reported_as_success(monkeypatch):

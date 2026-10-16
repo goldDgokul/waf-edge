@@ -1467,21 +1467,69 @@ async def deploy_rules(
         # Generate nginx configuration with validation
         try:
             nginx_config = waf_rule_generator.generate_nginx_config(rules)
-            
-            # Validate nginx configuration before deployment
-            if hasattr(nginx_manager, '_validate_nginx_config'):
-                if not nginx_manager._validate_nginx_config(nginx_config):
-                    raise HTTPException(status_code=400, detail="Generated nginx configuration is invalid")
-            
+
+            # Validate nginx configuration before deployment.
+            #
+            # TWO DEFECTS CORRECTED HERE, both found by an independent review of the
+            # deployment path (2026-10-16):
+            #
+            # 1. THE GUARD COULD NOT FAIL, AND FAILED OPEN. It read:
+            #        if hasattr(nginx_manager, '_validate_nginx_config'):
+            #            if not nginx_manager._validate_nginx_config(nginx_config):
+            #                raise HTTPException(400, ...)
+            #    `hasattr` is ALWAYS True for a method defined on the class, so the
+            #    condition was dead - and in the impossible False case, validation
+            #    would have been SKIPPED and the deployment would have proceeded
+            #    unvalidated. A guard whose failure mode is "do the dangerous thing"
+            #    is worse than no guard, because it reads like protection.
+            #    Calling the method directly is the honest form: if it is ever
+            #    removed, this raises AttributeError loudly instead of quietly
+            #    deploying unvalidated rules.
+            #
+            # 2. AN INVALID CONFIG WAS REPORTED AS A SERVER ERROR. The 400 raised
+            #    here was caught by the `except Exception` below and re-raised as
+            #    500 "Configuration generation failed", so an operator saw "our
+            #    server broke" when the truth was "the rules you asked for are
+            #    invalid". HTTPException is now passed through untouched, so the
+            #    400 reaches the caller with its real meaning.
+            if not nginx_manager._validate_nginx_config(nginx_config):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Generated nginx configuration is invalid and was NOT "
+                        "deployed. The rules were rejected before reaching any "
+                        "node."
+                    ),
+                )
+
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Failed to generate nginx configuration: {e}")
             raise HTTPException(status_code=500, detail=f"Configuration generation failed: {str(e)}")
         
         # Deploy to specified nodes or all nodes with comprehensive error handling
         try:
+            # SELECTIVE DEPLOYMENT, AND WHY THE OLD FORM WAS A LIE.
+            #
+            # This used to be:
+            #     if request.node_ids:
+            #         deployment_results = await ...deploy_rules_to_all_nodes(nginx_config)
+            #     else:
+            #         deployment_results = await ...deploy_rules_to_all_nodes(nginx_config)
+            # Both branches called the SAME function on ALL nodes. The API accepted
+            # and validated `node_ids`, then ignored it - so a caller asking to deploy
+            # to one node had every node changed, with no error and no warning. In a
+            # multi-tenant product "deploy to this tenant's node" is a safety
+            # boundary, not a convenience: silently widening the target set is how a
+            # rule meant for one tenant reaches another's traffic.
+            #
+            # The parameter is now honoured, and an unknown node id is REFUSED rather
+            # than silently dropped - a typo in a node id must not look like success.
             if request.node_ids:
-                # Deploy to specific nodes (would need to implement selective deployment)
-                deployment_results = await nginx_manager.deploy_rules_to_all_nodes(nginx_config)
+                deployment_results = await nginx_manager.deploy_rules_to_specific_nodes(
+                    request.node_ids, nginx_config
+                )
             else:
                 deployment_results = await nginx_manager.deploy_rules_to_all_nodes(nginx_config)
             

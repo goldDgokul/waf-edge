@@ -94,6 +94,44 @@ def remote_rule_destination(node_id: str) -> str:
 
 
 
+def staging_destination_for(node_id: str) -> str:
+    """
+    Where a candidate goes BEFORE it has been validated.
+
+    WHY THIS EXISTS AT ALL - the defect it removes (0A.1(c)):
+
+    `_deploy_via_file` used to write the generated rules straight to
+    `agent-<node>/rules.conf` - which is the directory the node's vhost includes:
+
+        include /etc/nginx/waf-rules/agent-<node>/*.conf;
+
+    and to do it with `os.replace()`, so the file appeared ATOMICALLY under the
+    live name with nothing having checked it. The method then returned False and
+    logged "STAGED, NOT ACTIVE", so it was honest about not ACTIVATING anything -
+    but the unvalidated file was nonetheless sitting in the include-matched path,
+    and the node's next legitimate reload would load it. An unvalidated candidate
+    is exactly what caused the original outage this workstream exists to prevent
+    (`[emerg] "if" directive is not allowed here in dynamic-node_1.conf:9`).
+
+    The honest report and the dangerous write were two separate facts, and only the
+    first had been fixed.
+
+    THE RULE NOW: a file that has not passed a real `nginx -t` must not be reachable
+    by any include glob. Staging is a sibling directory that no include matches -
+    its name deliberately does not end in `.conf` - so "not yet validated" cannot
+    become "loaded by accident".
+
+    This is deliberately a SEPARATE function from rule_destination_for(): the whole
+    point is that these two paths must be able to differ. The helper chain keeps
+    them in one place so no transport invents a third.
+    """
+    return os.path.join(
+        "_staging",
+        f"agent-{validate_node_id(node_id)}",
+        "rules.conf.pending",
+    )
+
+
 def rule_destination_for(node_id: str) -> str:
     """
     The ONE destination for a node's generated rules, relative to the rules root.
@@ -311,6 +349,111 @@ class NginxManager:
             
             return deployment_results
     
+    async def deploy_rules_to_specific_nodes(
+        self, node_ids: List[str], nginx_config: str
+    ) -> Dict[str, bool]:
+        """
+        Deploy to the named nodes ONLY. Unknown ids are refused, not skipped.
+
+        WHY THIS EXISTS: the API's `node_ids` parameter was accepted, validated
+        against a regex, and then silently ignored - both branches of the caller's
+        `if request.node_ids:` called deploy_rules_to_all_nodes(). So a request to
+        deploy to ONE node changed EVERY node, and the caller had no way to notice.
+        In a multi-tenant product the target set is a safety boundary: a rule meant
+        for one tenant's node must not reach another tenant's traffic because a
+        parameter was quietly dropped.
+
+        REFUSING ON AN UNKNOWN ID is deliberate. The tempting alternative - deploy to
+        whichever ids happen to exist and ignore the rest - turns a typo into a
+        silent partial deployment that still reports success. Every requested id is
+        either deployed to or reported False.
+
+        Validation order matters: the node ids are checked BEFORE any deployment, so
+        an invalid request cannot leave the cluster half-changed.
+        """
+        with self._lock:
+            logger.info(
+                f"Deploying rules to {len(node_ids)} named node(s): {node_ids}"
+            )
+
+            # 1. Every requested id must exist. Refuse the whole request otherwise.
+            unknown = [nid for nid in node_ids if nid not in self.nodes]
+            if unknown:
+                logger.error(
+                    f"Refusing selective deployment: node id(s) not in this cluster: "
+                    f"{unknown}. Known nodes: {sorted(self.nodes.keys())}"
+                )
+                return {nid: False for nid in node_ids}
+
+            # 2. Node ids that DO exist must still be valid as directory names, since
+            #    the id becomes part of a path (agent-<id>/rules.conf). validate_node_id
+            #    raises rather than sanitising - a mangled id would be a DIFFERENT
+            #    tenant's directory.
+            try:
+                for nid in node_ids:
+                    validate_node_id(nid)
+            except ValueError as e:
+                logger.error(f"Refusing selective deployment: {e}")
+                return {nid: False for nid in node_ids}
+
+            # 3. The same syntax gate the all-nodes path applies, so the two cannot
+            #    disagree about what is deployable.
+            if not self._validate_nginx_config(nginx_config):
+                logger.error("Invalid nginx configuration syntax")
+                return {nid: False for nid in node_ids}
+
+            targets = [self.nodes[nid] for nid in node_ids]
+            # Deduplicate while preserving the caller's order, so a repeated id does
+            # not deploy twice to the same node.
+            seen, unique_targets = set(), []
+            for n in targets:
+                if n.node_id not in seen:
+                    seen.add(n.node_id)
+                    unique_targets.append(n)
+
+            deployment_results: Dict[str, bool] = {}
+            tasks = [
+                asyncio.wait_for(
+                    self._deploy_to_node(node, nginx_config), timeout=30.0
+                )
+                for node in unique_targets
+            ]
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, node in enumerate(unique_targets):
+                    if isinstance(results[i], Exception):
+                        deployment_results[node.node_id] = False
+                        logger.error(
+                            f"Failed to deploy to {node.node_id}: {results[i]}"
+                        )
+                    else:
+                        deployment_results[node.node_id] = results[i]
+                        status = "Success" if results[i] else "Failed"
+                        logger.info(f"Deployment to {node.node_id}: {status}")
+            except Exception as e:
+                logger.error(f"Selective deployment task failed: {e}")
+                deployment_results = {nid: False for nid in node_ids}
+
+            # Any requested id that produced no result at all is a failure, not an
+            # absence - otherwise an unrecognised id vanishes from the report and the
+            # caller's "every node succeeded" check passes over it.
+            for nid in node_ids:
+                deployment_results.setdefault(nid, False)
+
+            self.deployment_history.append({
+                'timestamp': datetime.now().isoformat(),
+                'config_content_hash': hash(nginx_config),
+                'config_size': len(nginx_config),
+                'results': deployment_results,
+                'success_count': sum(deployment_results.values()),
+                'total_nodes': len(deployment_results),
+                'targeted_node_ids': list(node_ids),
+            })
+            if len(self.deployment_history) > 100:
+                self.deployment_history = self.deployment_history[-100:]
+
+            return deployment_results
+
     def _validate_nginx_config(self, config: str) -> bool:
         """Enhanced nginx configuration validation with comprehensive checks"""
         try:
@@ -597,16 +740,28 @@ class NginxManager:
             # ONE destination, shared with the SSH transport via the helper, so the
             # two can never disagree about where rules live.
             rules_file = os.path.join(SHARED_WAF_DIR, rule_destination_for(node.node_id))
-            os.makedirs(os.path.dirname(rules_file), exist_ok=True)
+
+            # WHERE THE CANDIDATE GOES - and why it is NO LONGER the live path.
+            #
+            # This used to be `rules_file`, promoted by os.replace(). That put an
+            # unvalidated file into the directory the vhost includes, where the
+            # node's next legitimate reload would load it. See
+            # staging_destination_for() for the full account. The write is now
+            # unreachable by any include glob until something has actually validated
+            # it, which this transport cannot do.
+            staged_file = os.path.join(
+                SHARED_WAF_DIR, staging_destination_for(node.node_id)
+            )
+            os.makedirs(os.path.dirname(staged_file), exist_ok=True)
 
             # Write to a temporary name and promote by rename, so a reader never
             # sees a half-written file. The name does not end in `.conf`, so it is
             # not matched by the vhost include `agent-<node>/*.conf` - a partial
             # write can never be loaded as configuration.
             #
-            # A UNIQUE name per attempt: a fixed `.staged` name means two
-            # concurrent deploys to the same node overwrite each other's candidate.
-            tmp_file = f"{rules_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+            # A UNIQUE name per attempt: a fixed name means two concurrent deploys
+            # to the same node overwrite each other's candidate.
+            tmp_file = f"{staged_file}.{os.getpid()}.{threading.get_ident()}.tmp"
             try:
                 with open(tmp_file, "w") as f:
                     f.write(f"# WAF rules for {node.node_id}\n")
@@ -614,20 +769,24 @@ class NginxManager:
                     f.write(nginx_config)
                     f.flush()
                     # Flush to disk before the rename, so a crash cannot leave a
-                    # torn file under the live name.
+                    # torn file under the staged name.
                     os.fsync(f.fileno())
-                os.replace(tmp_file, rules_file)
+                os.replace(tmp_file, staged_file)
             finally:
                 if os.path.exists(tmp_file):
                     os.unlink(tmp_file)
 
             logger.warning(
-                f"Rules for {node.node_id} were WRITTEN to {rules_file} but are "
-                f"STAGED, NOT ACTIVE. This transport cannot reload nginx (no docker "
-                f"CLI or socket in this container), so the node keeps serving its "
-                f"previous configuration until a legitimate reload happens. "
-                f"Reporting failure so no caller believes these rules are in force. "
-                f"Real activation requires the SSH path."
+                f"Rules for {node.node_id} were STAGED to {staged_file} and are "
+                f"NOT ACTIVE. This transport cannot validate or reload nginx (no "
+                f"nginx binary, no docker CLI and no docker socket in this "
+                f"container), so it cannot establish that these rules are loadable, "
+                f"let alone in force. The candidate is deliberately NOT placed in "
+                f"{rules_file}, which is the path the node's vhost includes: an "
+                f"unvalidated file there would be loaded by the next legitimate "
+                f"reload - the exact failure this workstream exists to prevent. "
+                f"Reporting failure so no caller believes these rules protect "
+                f"traffic. Real activation requires the SSH path."
             )
             return False
 
@@ -636,38 +795,49 @@ class NginxManager:
             return False
 
     async def _deploy_via_api(self, node: NginxNode, nginx_config: str) -> bool:
-        """Deploy configuration via API with proper error handling"""
-        try:
-            timeout = httpx.Timeout(30.0, connect=10.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{node.api_endpoint}/api/config/deploy",
-                    json={
-                        'config_content': nginx_config,
-                        'config_type': 'waf_rules',
-                        'reload_nginx': True,
-                        'validate_first': True
-                    },
-                    headers={
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'nginx-waf-ai/1.0'
-                    }
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    return result.get('success', False)
-                else:
-                    logger.error(f"API deployment failed with status {response.status_code}: {response.text}")
-                    return False
-                    
-        except httpx.TimeoutException:
-            logger.error(f"API deployment timeout for {node.node_id}")
-            return False
-        except Exception as e:
-            logger.error(f"API deployment failed for {node.node_id}: {e}")
-            return False
-    
+        """
+        REMOVED FROM THE SUCCESS PATH IN v7.x (0A.2 / 0A.4 correction).
+
+        WHAT THIS USED TO DO, and why it was wrong:
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('success', False)
+
+        It returned the REMOTE's own claim of success. Nothing here checked that any
+        rule became active: no `nginx -t`, no `nginx -T`, no observation of behaviour.
+        A node agent that replied {"success": true} while deploying nothing made this
+        method return True, and the caller read that as "these rules are enforcing".
+        Measured consequence: it was the one code path that could report a deployment
+        as successful WITHOUT VALIDATING ANYTHING - which is precisely what items
+        0A.2 and 0A.4 claim cannot happen ("remove the unconditional success return";
+        "never return success for a deployment that did not take effect").
+
+        Why it was not caught earlier: it was unreachable in this Docker stack
+        (`api_endpoint` is None for compose-built nodes, and no service in the stack
+        implements `/api/config/deploy`), so no test and no manual run ever exercised
+        it. An unreachable hole is still a hole: `POST /api/nodes/add` accepts an
+        api_endpoint, at which point this path becomes live.
+
+        THE RULE THIS METHOD NOW FOLLOWS: a transport may only report success if it
+        can itself establish that the rules are in force. This one cannot - it has no
+        access to the node's nginx. It therefore reports failure and says why, the
+        same honest refusal the file transport makes.
+
+        Kept (not deleted) so that an operator adding an api_endpoint is told plainly
+        that the capability was withdrawn rather than silently skipped, and so that
+        restoring it means writing a real verification step alongside it.
+        """
+        logger.error(
+            f"API deployment to {node.node_id} ({node.api_endpoint}) REFUSED: this "
+            f"transport cannot verify that rules became active - it would have to "
+            f"take the remote's word for it. Previously it did, and returned that "
+            f"claim as success. Rules are NOT deployed through this path. Use the "
+            f"SSH transport (which runs nginx validation and verification) or the "
+            f"file transport (which stages and reports truthfully)."
+        )
+        return False
+
     async def _deploy_via_ssh(self, node: NginxNode, nginx_config: str) -> bool:
         """Deploy configuration via SSH with enhanced security"""
         try:
@@ -965,7 +1135,21 @@ class NginxManager:
                     'error': 'No expected directives to verify'
                 }
 
-            missing = [line for line in expected_lines if line not in section]
+            # EXACT LINE MATCH, NOT SUBSTRING.
+            #
+            # This was `if line not in section`, a substring test. Measured
+            # consequence: an expected directive `deny 1.2.3.4;` was satisfied by a
+            # loaded line `deny 1.2.3.45;`, because the shorter string occurs inside
+            # the longer one. The verifier would have reported "all expected
+            # directives are loaded" while the rule the operator asked for was not
+            # in force - the same false-success class as the old "any line survived"
+            # weakness this method was rewritten to remove, one notch down.
+            #
+            # Comparing whole lines removes it. nginx re-emits source lines verbatim
+            # in `nginx -T`, so a directive the operator expected appears as its own
+            # line; if it does not, it is not loaded.
+            section_lines = {ln.strip() for ln in section.split('\n') if ln.strip()}
+            missing = [line for line in expected_lines if line not in section_lines]
 
             if missing:
                 return {
