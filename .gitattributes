@@ -10,3 +10,4 @@
 *.sh                 text eol=lf
 Dockerfile           text eol=lf
 ssh/sshd_config      text eol=lf
+**/ssh/sshd_config   text eol=lf
