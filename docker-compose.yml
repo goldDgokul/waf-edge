@@ -47,10 +47,25 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      # WHY NOT curl: this check used to be ["CMD","curl","-f",...] and curl is NOT
+      # installed in the api image, so the check failed with
+      #   OCI runtime exec failed: exec: "curl": executable file not found in $PATH
+      # on EVERY interval. The container reported `unhealthy` permanently while the API
+      # served 200 the whole time (measured: a 65-failure streak on a healthy service).
+      # A health indicator that is always red is worse than none: orchestration that
+      # respects it would treat a working API as down, and everyone else learns to
+      # ignore it - which is how a real outage gets missed later.
+      # python is already in the image and its stdlib is enough, so this needs no new
+      # binary in a security product's control plane.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request,urllib.error;\ntry:\n    r=urllib.request.urlopen('http://localhost:8000/health', timeout=5)\n    sys.exit(0 if r.status==200 else 1)\nexcept Exception as e:\n    print('health check failed:', e); sys.exit(1)"
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s
     restart: unless-stopped
     command: ["python", "run_server.py"]
 
