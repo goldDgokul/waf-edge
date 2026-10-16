@@ -10,6 +10,7 @@ import httpx
 import paramiko
 import os
 import re
+import time
 from datetime import datetime
 from typing import List, Dict, Optional
 from dataclasses import dataclass
@@ -121,6 +122,26 @@ def staging_destination_for(node_id: str) -> str:
     its name deliberately does not end in `.conf` - so "not yet validated" cannot
     become "loaded by accident".
 
+    WHY THIS MATTERS MORE THAN THE HONEST REPORT DID - measured 2026-10-16.
+    The old defence was "the node's next reload would fail loudly". TESTED, and it
+    is FALSE in the way that matters:
+
+        planted an invalid directive at agent-node_1/RELOAD-TEST.conf
+        nginx -t          -> [emerg] unknown "x" variable ... test failed
+        nginx -s reload   -> [emerg] unknown "x" variable ... EXIT CODE 0
+        node afterwards   -> still serving 200
+
+    So on a RELOAD the master discards the bad config, the old workers keep
+    serving, and the only trace is a log line - the QUIETEST possible failure, not a
+    loud one. On a RESTART the same config is fatal: the master cannot start, and
+    `restart: unless-stopped` (docker-compose.yml, both node services) turns it into
+    a crash-loop serving nothing.
+
+    The hazard was therefore a LATENT LANDMINE, armed by whatever later caused a
+    reload or restart - an operator reloading for an unrelated change, a host
+    reboot, a daemon upgrade - and never by the caller who got the honest failure
+    message. The report protected the one party least able to be hurt by it.
+
     This is deliberately a SEPARATE function from rule_destination_for(): the whole
     point is that these two paths must be able to differ. The helper chain keeps
     them in one place so no transport invents a third.
@@ -130,6 +151,62 @@ def staging_destination_for(node_id: str) -> str:
         f"agent-{validate_node_id(node_id)}",
         "rules.conf.pending",
     )
+
+
+# How long an unvalidated candidate may sit in staging before it is swept.
+#
+# WHY THIS EXISTS (found by an independent review, 2026-10-16): the staging path is
+# one FIXED filename per node, so a new deploy overwrites the previous candidate -
+# but nothing ever removed them, and `_staging` is on the shared volume the nodes
+# mount. Left alone it accumulates one directory per node forever, and stale
+# candidates are a hazard of their own: a later promotion step, or an operator
+# copying "the staged file", could pick up a candidate from days ago.
+#
+# 24 hours is deliberately conservative: long enough that a candidate staged during
+# an incident investigation is still there to inspect, short enough that nothing
+# ancient survives to be mistaken for current.
+STAGING_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def sweep_stale_staged_candidates(max_age_seconds: int = STAGING_MAX_AGE_SECONDS) -> int:
+    """
+    Delete staged candidates older than `max_age_seconds`. Returns how many went.
+
+    Safety, so this can never become its own incident:
+      - it NEVER touches the live path (only `_staging/`), so the worst it can do is
+        remove a candidate that was never validated and never activated;
+      - it only removes regular files, and never follows a symlink out of the tree;
+      - a failure to stat or unlink one entry is logged and skipped, never raised, so
+        housekeeping can never break a deployment.
+
+    Called opportunistically after a successful stage, so it costs nothing on the
+    happy path and cannot be forgotten as a separate scheduled job.
+    """
+    root = os.path.join(SHARED_WAF_DIR, "_staging")
+    if not os.path.isdir(root):
+        return 0
+
+    now = time.time()
+    removed = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                try:
+                    if os.path.islink(full):
+                        continue
+                    st = os.stat(full)
+                    if not os.path.isfile(full):
+                        continue
+                    if now - st.st_mtime > max_age_seconds:
+                        os.unlink(full)
+                        removed += 1
+                        logger.info(f"Swept stale staged candidate (age checked): {full}")
+                except OSError as e:
+                    logger.warning(f"Could not sweep {full}: {e}")
+    except Exception as e:
+        logger.warning(f"Staging sweep failed, continuing: {e}")
+    return removed
 
 
 def rule_destination_for(node_id: str) -> str:
@@ -788,6 +865,14 @@ class NginxManager:
                 f"Reporting failure so no caller believes these rules protect "
                 f"traffic. Real activation requires the SSH path."
             )
+
+            # Housekeeping on the happy path, so it cannot be forgotten as a
+            # separate scheduled job. Best-effort: the sweep swallows its own
+            # errors, and it only ever touches _staging/.
+            swept = sweep_stale_staged_candidates()
+            if swept:
+                logger.info(f"Swept {swept} stale staged candidate(s)")
+
             return False
 
         except Exception as e:

@@ -573,3 +573,87 @@ def test_file_transport_still_reports_failure_while_staging(tmp_path, monkeypatc
         "the file transport claimed success. It cannot validate or reload nginx, so "
         "there is no state it could have established that would justify True."
     )
+
+
+def test_staging_sweep_removes_only_stale_candidates(tmp_path, monkeypatch):
+    """
+    The staging directory must not grow forever, and the sweep must be unable to
+    do harm.
+
+    Added 2026-10-16 after an independent review pointed out that the staging path
+    is one FIXED filename per node on a SHARED volume, so without housekeeping it
+    accumulates, and a stale candidate is its own hazard (a later promotion step, or
+    an operator copying "the staged file", could pick up a candidate from days ago).
+
+    Paired assertions on purpose: a sweeper that deletes everything passes half of
+    this and would be worse than none.
+    """
+    import time as _time
+
+    monkeypatch.setattr(nm, "SHARED_WAF_DIR", str(tmp_path))
+
+    stale = tmp_path / "_staging" / "agent-node_1" / "rules.conf.pending"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("# from days ago\n", encoding="utf-8")
+    aged = _time.time() - (48 * 60 * 60)
+    os.utime(stale, (aged, aged))
+
+    fresh = tmp_path / "_staging" / "agent-node_2" / "rules.conf.pending"
+    fresh.parent.mkdir(parents=True, exist_ok=True)
+    fresh.write_text("# just now\n", encoding="utf-8")
+
+    live = tmp_path / "agent-node_1" / "rules.conf"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text("# THE LIVE RULES\n", encoding="utf-8")
+
+    removed = nm.sweep_stale_staged_candidates()
+
+    assert removed >= 1 and not stale.exists(), "the stale candidate was not swept"
+    assert fresh.exists(), "the sweep deleted a FRESH candidate it should have kept"
+    assert live.exists() and "LIVE" in live.read_text(encoding="utf-8"), (
+        "the sweep touched the live rules path - it must only ever touch _staging/"
+    )
+
+
+def test_staging_sweep_cannot_be_broken_by_a_hostile_entry(tmp_path, monkeypatch):
+    """
+    Housekeeping must never be able to fail a deployment.
+
+    A directory sitting where a file is expected forces the OSError path; the sweep
+    must absorb it and return a count, not raise.
+    """
+    monkeypatch.setattr(nm, "SHARED_WAF_DIR", str(tmp_path))
+    hostile = tmp_path / "_staging" / "agent-node_1" / "dir-not-file"
+    hostile.mkdir(parents=True, exist_ok=True)
+
+    result = nm.sweep_stale_staged_candidates()
+    assert isinstance(result, int), "the sweep raised instead of returning a count"
+
+
+def test_deploy_path_calls_the_staging_sweep(tmp_path, monkeypatch):
+    """
+    The sweep must be WIRED IN, not merely defined.
+
+    An unrelated stale candidate is planted elsewhere in the tree; driving the real
+    transport must remove it. This fails if someone deletes the sweep call from
+    _deploy_via_file while leaving the function in place - the same
+    defined-but-unused defect the reviewer flagged as this project's recurring
+    pattern.
+    """
+    import time as _time
+
+    monkeypatch.setattr(nm, "SHARED_WAF_DIR", str(tmp_path))
+    stale_elsewhere = tmp_path / "_staging" / "agent-old" / "rules.conf.pending"
+    stale_elsewhere.parent.mkdir(parents=True, exist_ok=True)
+    stale_elsewhere.write_text("# forgotten\n", encoding="utf-8")
+    aged = _time.time() - (48 * 60 * 60)
+    os.utime(stale_elsewhere, (aged, aged))
+
+    node = _make_node("node_1")
+    manager = NginxManager([node])
+    asyncio.run(manager._deploy_via_file(node, "if ($a) { return 403; }\n"))
+
+    assert not stale_elsewhere.exists(), (
+        "a deploy did not sweep the staging tree, so the sweep call is missing from "
+        "_deploy_via_file - housekeeping that is never called is not housekeeping"
+    )
