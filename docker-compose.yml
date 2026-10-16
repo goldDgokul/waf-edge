@@ -38,11 +38,17 @@ services:
       - LOG_LEVEL=INFO
       - NGINX_NODES=http://log-server-1:8080,http://log-server-2:8080
       - WAF_CORS_ORIGINS=http://localhost:3080,http://127.0.0.1:3080
+      # 0A.13: SSH credentials for the real nginx nodes, so the SSH transport can
+      # actually reach a node. NGINX_NODES points at the LOG servers (whose
+      # hostname is wrong for SSH); this overlay supplies the real node host,
+      # port, user, key and reload command. The key is mounted read-only below.
+      - 'WAF_SSH_NODES=[{"node_id":"node_1","ssh_host":"nginx-node-1","ssh_port":22,"ssh_username":"root","ssh_key_path":"/app/ssh/id_ed25519","nginx_config_path":"/etc/nginx/conf.d","nginx_reload_command":"nginx -s reload"}]'
     volumes:
       - ./data:/app/data
       - ./models:/app/models
       - ./logs:/app/logs
       - ./docker/shared/waf-rules:/app/waf-rules
+      - ./docker/nginx-node-1/ssh/id_ed25519:/app/ssh/id_ed25519:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -71,10 +77,16 @@ services:
 
   # Nginx Node 1 - Simulates a production web server
   nginx-node-1:
-    image: nginx:alpine
+    build:
+      context: ./docker/nginx-node-1
+      dockerfile: Dockerfile
     container_name: nginx-node-1
     ports:
       - "8081:80"
+      # Loopback-only: waf-api reaches the node over the compose network by name;
+      # the host publish exists only so the local test can drive the chain via
+      # 127.0.0.1:2222. Binding to loopback keeps the dev sshd off the LAN.
+      - "127.0.0.1:2222:22"
     volumes:
       - ./docker/nginx-node-1/nginx.conf:/etc/nginx/nginx.conf
       - ./docker/nginx-node-1/default.conf:/etc/nginx/conf.d/default.conf

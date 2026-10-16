@@ -6,6 +6,7 @@ FastAPI-based API for the nginx WAF AI system with comprehensive security.
 
 import asyncio
 import ipaddress
+import json
 import os
 import ssl
 import threading
@@ -386,6 +387,47 @@ async def startup_components():
                             nginx_config_path="/etc/nginx/conf.d",
                             nginx_reload_command="sudo systemctl reload nginx"
                         ))
+                
+                # 0A.13 - OVERLAY SSH CREDENTIALS ONTO THE NODES.
+                #
+                # NGINX_NODES points at the LOG servers (http://log-server-N:8080),
+                # and this code derives ssh_host from that URL's hostname - which is
+                # the log-server container, NOT the nginx node. The real node host,
+                # port, username, key and reload command therefore cannot come from
+                # NGINX_NODES. They come from WAF_SSH_NODES (JSON), one object per
+                # node, matched by node_id. Without this, the SSH transport has
+                # nothing to connect to (measured: sshd is ABSENT on the stock node
+                # image, and even with sshd it would dial the log-server).
+                #
+                # The overlay mutates the NginxNode dataclass in place. Only the
+                # fields present in the JSON entry are changed; everything else keeps
+                # its value from the NGINX_NODES construction above.
+                ssh_overlay = os.getenv('WAF_SSH_NODES', '')
+                if ssh_overlay:
+                    try:
+                        overlay = json.loads(ssh_overlay)
+                        by_id = {n.node_id: n for n in nginx_nodes}
+                        for entry in overlay:
+                            nid = entry.get('node_id')
+                            if nid not in by_id:
+                                logger.warning(
+                                    f"WAF_SSH_NODES names node {nid!r}, which is "
+                                    f"not in this cluster ({sorted(by_id)}); ignored"
+                                )
+                                continue
+                            node = by_id[nid]
+                            node.ssh_host = entry.get('ssh_host', node.ssh_host)
+                            node.ssh_port = int(entry.get('ssh_port', node.ssh_port))
+                            node.ssh_username = entry.get('ssh_username', node.ssh_username)
+                            node.ssh_key_path = entry.get('ssh_key_path', node.ssh_key_path)
+                            node.nginx_config_path = entry.get('nginx_config_path', node.nginx_config_path)
+                            node.nginx_reload_command = entry.get('nginx_reload_command', node.nginx_reload_command)
+                            logger.info(
+                                f"SSH overlay applied to {nid}: {node.ssh_username}@"
+                                f"{node.ssh_host}:{node.ssh_port}"
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to parse WAF_SSH_NODES: {e}")
                 
                 if nginx_nodes:
                     nginx_manager = NginxManager(nginx_nodes)

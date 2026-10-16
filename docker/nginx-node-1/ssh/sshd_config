@@ -1,0 +1,25 @@
+# sshd_config for the 0A.13 DEV-ONLY SSH activation rig.
+#
+# Deliberately restrictive: key-only root login, no password auth, no PAM.
+# This is a throwaway dev container on the compose network; it must never be
+# mistaken for a production node's sshd config.
+
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+PidFile /var/run/sshd.pid
+
+# The deployment chain uses SFTP (paramiko's sftp.put/rename/remove) to place,
+# back up and roll back the candidate. Alpine's openssh-server does not enable it
+# by default (and does not ship the binary), so it must be stated explicitly.
+Subsystem sftp internal-sftp
