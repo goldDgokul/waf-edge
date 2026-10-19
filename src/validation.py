@@ -300,10 +300,21 @@ class SecureRuleDeploymentRequest(BaseModel):
             if not re.match(r'^[a-zA-Z0-9\-_]+$', rule['rule_id']):
                 raise ValueError(f'Invalid rule_id format in rule {i}')
             
-            # Validate action
-            valid_actions = ['block', 'allow', 'log', 'rate_limit']
+            # Validate action (0A.10, Decision I = Option B: block-only).
+            #
+            # The only actions the edge actually ENFORCES are `block` and
+            # `rate_limit` (to_nginx_config branches on rule_type and hard-blocks
+            # or rate-limits). `allow` and `log` were accepted here but never
+            # enforced - a rule recorded as "log only" was silently hard-blocked
+            # at the edge, a truthfulness gap. They are now REJECTED rather than
+            # silently treated as block rules, so no one can record an action the
+            # system does not honour.
+            valid_actions = ['block', 'rate_limit']
             if rule['action'] not in valid_actions:
-                raise ValueError(f'Invalid action in rule {i}: {rule["action"]}')
+                raise ValueError(
+                    f'Invalid action in rule {i}: {rule["action"]!r}. '
+                    f'Supported actions: {valid_actions}.'
+                )
         
         return v
 
