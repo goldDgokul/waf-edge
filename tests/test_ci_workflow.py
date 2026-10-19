@@ -43,3 +43,24 @@ def test_docker_job_uses_compose_v2_for_start_and_cleanup():
     assert "docker compose down -v" in run_commands, (
         "cleanup does not use the same available Compose v2 plugin"
     )
+
+
+@pytest.mark.structural
+def test_docker_job_installs_application_before_test_dependencies():
+    """Docker collection imports application modules before marker deselection."""
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["docker-test"]["steps"]
+    run_step = next(step for step in steps if step.get("name") == "Run Docker Compose tests")
+    command = run_step.get("run", "")
+
+    app_install = "pip install -r requirements.txt"
+    test_install = "pip install -r test-requirements.txt"
+
+    assert app_install in command, (
+        "docker-test omits application dependencies, so pytest collection cannot "
+        "import modules requiring FastAPI, Pydantic, Loguru, or NumPy"
+    )
+    assert test_install in command
+    assert command.index(app_install) < command.index(test_install), (
+        "docker-test must install application requirements before test-only tooling"
+    )

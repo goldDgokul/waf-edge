@@ -95,7 +95,10 @@ jobs:
         docker compose up -d redis
         sleep 10
         
-        # Install test dependencies
+        # Install application dependencies before test tooling. Pytest imports all
+        # collected modules before marker deselection, including modules that need
+        # FastAPI, Pydantic, Loguru, and NumPy.
+        pip install -r requirements.txt
         pip install -r test-requirements.txt
         
         # Run the docker-marked behavioural tests. test_ssh_activation.py needs a
