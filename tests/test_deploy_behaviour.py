@@ -91,11 +91,11 @@ REAL_BASIC = REPO_ROOT / "docker" / "shared" / "waf-rules" / "basic.conf"
 # per-node include into the SAME shared volume, so an edit to node 2 was just as
 # capable of breaking the pipeline and passed silently.
 EXPECTED_SHA256 = {
-    REAL_NGINX_CONF: "366a4a02038f2d8e7cdb130ae109d0fbd0b5450392b6ad9718a2c8896d4473fb",
-    REAL_VHOST: "f7d1f4c587997a2a463d8f46a6fb97a1b68cac49b4a299afdfca1a1d8180723d",
-    REAL_NODE2_NGINX_CONF: "84c3cf298a4626e6e5fa2a4d731634b5fe28f61bc5c27ae826044305352e3358",
-    REAL_NODE2_VHOST: "7ddb645e3aa4b40dc44ec1cb1e9bf77f43750866262cfe7eb51b050ea7f86ca6",
-    REAL_BASIC: "2bbb037fa6ea42b34a1383e334cb7b7d3c7808f199642c25ca42a46784081924",
+    REAL_NGINX_CONF: "10ca51c3724f872829224ae3428e59a664578eee09486ad08f1ab4d0a74fba47",
+    REAL_VHOST: "755d5dac8166e3b2f8e86ed7f7ca73b2ab08bac1ad6386af8d334ec92d159272",
+    REAL_NODE2_NGINX_CONF: "f0435847a7ef245eb50a2253d87d10600b6e8f37feae26b9dd7529eb515ffe14",
+    REAL_NODE2_VHOST: "1bb95a3b72714c2dbc39b7b923b3c008a26b4a145c55422fdc41acee82ba799a",
+    REAL_BASIC: "1295a8892e68cfd24b1682c12fe9b3b16fd4e7809e06e8cc97a25ec39d1b8388",
 }
 
 # A rules file containing an `if`, which is invalid at http scope and valid in
@@ -137,8 +137,12 @@ docker = pytest.mark.docker
 structural = pytest.mark.structural
 
 
+# The recorded digest is over a canonical LF byte representation. Git can check
+# text files out as CRLF on Windows and LF on Linux; hashing raw working-tree bytes
+# made unchanged shipped configuration fail only in GitHub Actions.
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    canonical = Path(path).read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _tripwire_mismatches(expected_map: dict) -> list:
@@ -155,7 +159,8 @@ def _tripwire_mismatches(expected_map: dict) -> list:
         actual = _sha256(path)
         if actual != expected:
             mismatched.append(
-                f"{Path(path).name}: expected {expected[:12]}... got {actual[:12]}..."
+                f"{Path(path).relative_to(REPO_ROOT)}: "
+                f"expected {expected[:12]}... got {actual[:12]}..."
             )
     return mismatched
 
@@ -285,6 +290,21 @@ def _node(node_id: str = "node_1"):
 # =============================================================================
 
 @structural
+def test_tripwire_hash_is_independent_of_platform_line_endings(tmp_path):
+    """The same nginx text must have one digest on Windows and Linux."""
+    lf_file = tmp_path / "lf.conf"
+    crlf_file = tmp_path / "crlf.conf"
+    content = "events {}\nhttp {\n    include /etc/nginx/conf.d/*.conf;\n}\n"
+    lf_file.write_bytes(content.encode("utf-8"))
+    crlf_file.write_bytes(content.replace("\n", "\r\n").encode("utf-8"))
+
+    assert _sha256(lf_file) == _sha256(crlf_file), (
+        "the tripwire hashes checkout-specific line endings, so an unchanged "
+        "configuration fails when Windows CRLF becomes Linux LF"
+    )
+
+
+@structural
 def test_fixture_mounts_the_repository_config_unchanged():
     """
     The drift tripwire, and the ONLY detector of an edit to a shipping vhost.
@@ -340,8 +360,11 @@ def test_tripwire_guards_both_nodes():
         "the tripwire did not notice a recorded digest that no file can match. It "
         "is incapable of detecting drift, so every assertion it guards is worthless."
     )
-    assert REAL_VHOST.name in reported[0], (
-        f"the tripwire reported a mismatch but not the file that was rigged: {reported}"
+    expected_path = str(REAL_VHOST.relative_to(REPO_ROOT))
+    matching_reports = [message for message in reported if expected_path in message]
+    assert len(matching_reports) == 1, (
+        f"the tripwire reported mismatches but did not identify the rigged path "
+        f"exactly once: {reported}"
     )
 
     # The real map must be healthy, so the rigging above is the only failure
