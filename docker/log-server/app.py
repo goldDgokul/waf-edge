@@ -19,7 +19,10 @@ LOG_PATH = os.getenv("LOG_PATH", "/logs/access.log")
 
 def parse_nginx_log_line(line: str) -> Optional[Dict]:
     """Parse nginx log line into structured data"""
-    # Nginx log format: IP - user [timestamp] "method url protocol" status size "referer" "user-agent" request_time upstream_time request_length bytes_sent
+    # Nginx log format: IP - user [timestamp] "method url protocol" status size "referer" "user-agent" request_time upstream_time request_length bytes_sent [host]
+    # The final `host` is the Host header (customer/tenant identity), appended by
+    # the 0A.8 log-format change. It is captured from the trailing tail so the
+    # positional groups above are unchanged.
     pattern = r'^(\S+) - (\S+) \[([^\]]+)\] "([A-Z]+) ([^"]*) HTTP/[^"]*" (\d+) (\d+) "([^"]*)" "([^"]*)"(.*)'
     
     match = re.match(pattern, line.strip())
@@ -29,6 +32,9 @@ def parse_nginx_log_line(line: str) -> Optional[Dict]:
     try:
         groups = match.groups()
         timestamp_str = groups[2]
+        # The trailing tail is " <req_time> <upstream_time> <req_len> <bytes_sent> [host]".
+        tail = groups[9].strip().split()
+        host = tail[4] if len(tail) >= 5 else ''
         
         # Parse timestamp
         try:
@@ -45,6 +51,7 @@ def parse_nginx_log_line(line: str) -> Optional[Dict]:
             "referer": groups[7] if groups[7] != '-' else '',
             "user_agent": groups[8],
             "source_ip": groups[0],
+            "host": host,
             "headers": {
                 "user-agent": groups[8],
                 "referer": groups[7] if groups[7] != '-' else ''
