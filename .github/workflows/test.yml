@@ -58,9 +58,12 @@ jobs:
       run: |
         # 0A.7(c): -m "unit" selected ZERO tests (no test carries that marker).
         # The collection now runs clean (the 5 dead files are quarantined in
-        # conftest.py collect_ignore), so run everything that does not need Docker
-        # (the docker-marked tests skip when Docker is absent on the runner).
-        pytest tests/ -m "not docker" --cov=src --cov-report=xml
+        # conftest.py collect_ignore), so run everything that does not need Docker.
+        # test_ssh_activation.py is excluded here too: it is NOT docker-marked
+        # (only a skipif on the docker CLI), so -m "not docker" would still select
+        # it, and on a runner with Docker present its skipif does not fire and it
+        # errors reaching 127.0.0.1:2222 (no live node). It needs a live SSH node.
+        pytest tests/ -m "not docker" --ignore=tests/test_ssh_activation.py --cov=src --cov-report=xml
     
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3
@@ -95,7 +98,9 @@ jobs:
         # live SSH-capable node (not provisioned in this job), so it is excluded
         # here; the throwaway-nginx-container tests in test_deploy_behaviour.py
         # run against a real `docker run` nginx and DO work in CI.
-        pytest tests/ -m "docker" --ignore=tests/test_ssh_activation.py -v --tb=short
+        # --no-cov: these 9 tests cannot cover 3401 statements, so the inherited
+        # --cov-fail-under=30 would fail the JOB (not the tests) at ~14% coverage.
+        pytest tests/ -m "docker" --ignore=tests/test_ssh_activation.py --no-cov -v --tb=short
     
     - name: Cleanup
       if: always()

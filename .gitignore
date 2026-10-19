@@ -83,6 +83,7 @@ docker/nginx-node-1/ssh/id_ed25519.pub
 .coverage
 htmlcov/
 .tox/
+coverage.xml
 
 
 # nginx runtime output: docker-compose bind-mounts these directories as
