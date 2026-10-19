@@ -69,9 +69,16 @@ class AuthManager:
     
     def _init_default_admin(self):
         """Initialize default admin user"""
-        admin_password = os.getenv('WAF_ADMIN_PASSWORD', 'admin123')
-        if admin_password == 'admin123':
-            logger.warning("Using default admin password. Set WAF_ADMIN_PASSWORD environment variable.")
+        # 0A.6: no fixed default password. If WAF_ADMIN_PASSWORD is not set, a
+        # random one is generated (matching how WAF_JWT_SECRET already behaves) so
+        # the default credential is unpredictable rather than "admin123".
+        admin_password = os.getenv('WAF_ADMIN_PASSWORD')
+        if not admin_password:
+            admin_password = secrets.token_urlsafe(24)
+            logger.warning(
+                "WAF_ADMIN_PASSWORD not set; generated a random one-time admin "
+                "password. Set WAF_ADMIN_PASSWORD for a stable, known credential."
+            )
         
         admin_user = self.create_user(
             username='admin',
@@ -79,9 +86,9 @@ class AuthManager:
             roles=['admin', 'operator', 'viewer']
         )
         
-        # Generate default API key for admin
-        api_key = self.generate_api_key('admin')
-        logger.info(f"Default admin API key: {api_key}")
+        # 0A.6: do NOT log the API key in plaintext. The key is a credential;
+        # logging it writes a bearer token to stdout/logs where it is recoverable.
+        self.generate_api_key('admin')
     
     def hash_password(self, password: str) -> str:
         """Hash password using bcrypt"""
