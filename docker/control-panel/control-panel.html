@@ -1362,19 +1362,9 @@
                             <div class="card-body">
                                 <div class="logs-container" id="logs">
                                     <div class="log-entry">
-                                        <span class="log-timestamp">[2024-01-20 10:30:15]</span>
+                                        <span class="log-timestamp">[startup]</span>
                                         <span class="log-level-info">[INFO]</span>
-                                        WAF AI Control Panel initialized
-                                    </div>
-                                    <div class="log-entry">
-                                        <span class="log-timestamp">[2024-01-20 10:30:16]</span>
-                                        <span class="log-level-success">[SUCCESS]</span>
-                                        API connection established
-                                    </div>
-                                    <div class="log-entry">
-                                        <span class="log-timestamp">[2024-01-20 10:30:17]</span>
-                                        <span class="log-level-info">[INFO]</span>
-                                        Waiting for user commands...
+                                        Control panel loaded
                                     </div>
                                 </div>
                             </div>
@@ -2102,16 +2092,12 @@
                                 <div class="rules-list" id="active-rules-list">
                                     <div class="rule-item">
                                         <div class="rule-header">
-                                            <span class="rule-type">BLOCK_IP</span>
-                                            <span class="rule-priority">HIGH</span>
-                                            <span class="rule-status active">ACTIVE</span>
+                                            <span class="rule-type">No rules loaded</span>
+                                            <span class="rule-priority">—</span>
+                                            <span class="rule-status">—</span>
                                         </div>
                                         <div class="rule-content">
-                                            <code>deny 192.168.1.100;</code>
-                                        </div>
-                                        <div class="rule-meta">
-                                            <span class="rule-created">Created: 2024-01-20 10:30:15</span>
-                                            <span class="rule-expires">Expires: 2024-01-21 10:30:15</span>
+                                            <code>Deploy rules to see the active list.</code>
                                         </div>
                                     </div>
                                 </div>
@@ -2555,19 +2541,14 @@
                 const logs = document.getElementById('traffic-logs');
                 logs.innerHTML = '';
                 
-                // Add some sample traffic log entries
-                const sampleEntries = [
-                    '[2024-01-20 10:35:22] GET /api/health - 200 - 15ms',
-                    '[2024-01-20 10:35:21] POST /api/processing/start - 200 - 45ms',
-                    '[2024-01-20 10:35:20] GET /metrics - 200 - 8ms'
-                ];
-                
-                sampleEntries.forEach(entry => {
-                    const logEntry = document.createElement('div');
-                    logEntry.className = 'log-entry';
-                    logEntry.innerHTML = `<span class="log-timestamp">${entry}</span>`;
-                    logs.appendChild(logEntry);
-                });
+                // 0A.11: the traffic log previously rendered three hardcoded,
+                // back-dated sample entries (2024-01-20) as if they were live. The
+                // API does not expose per-request traffic here, so show an honest
+                // empty-state line instead of fabricated logs.
+                const entry = document.createElement('div');
+                entry.className = 'log-entry';
+                entry.innerHTML = '<span class="log-timestamp">No live traffic log data (not wired to a source).</span>';
+                logs.appendChild(entry);
                 
                 addLog('Traffic log refreshed', 'info');
             } catch (error) {
@@ -2597,18 +2578,21 @@
                 const result = await apiCall('/debug/status');
                 const mlEngine = result.ml_engine;
                 
-                updateElement('model-type', mlEngine.initialized ? 'Random Forest' : 'Not loaded');
-                updateElement('training-samples', '1000 samples');
-                updateElement('last-trained', mlEngine.is_trained ? 'Recent' : 'Never');
-                updateElement('model-version', mlEngine.initialized ? 'v1.0' : 'N/A');
+                // 0A.11: /debug/status reports only `initialized` and `is_trained`.
+                // The model TYPE is not reported, and accuracy/precision/recall/f1
+                // are NOT measured by the API. Previously this hardcoded 'Random
+                // Forest', '1000 samples', '87%'/'85%'/'89%'/'87%'. Show only what
+                // the API actually reports; everything else is "not measured".
+                updateElement('model-type', mlEngine.initialized ? 'initialized' : 'not loaded');
+                updateElement('training-samples', 'not measured');
+                updateElement('last-trained', mlEngine.is_trained ? 'trained' : 'not trained');
+                updateElement('model-version', mlEngine.initialized ? 'active' : 'N/A');
                 
-                // Update performance metrics
-                if (mlEngine.is_trained) {
-                    updateMetric('ml-model-accuracy', '87%');
-                    updateMetric('ml-model-precision', '85%');
-                    updateMetric('ml-model-recall', '89%');
-                    updateMetric('ml-model-f1', '87%');
-                }
+                // Performance metrics are not measured — mark them, do not invent.
+                updateMetric('ml-model-accuracy', 'not measured');
+                updateMetric('ml-model-precision', 'not measured');
+                updateMetric('ml-model-recall', 'not measured');
+                updateMetric('ml-model-f1', 'not measured');
                 
                 addLog('ML model information updated', 'info');
             } catch (error) {
@@ -2635,19 +2619,24 @@
                 const logs = document.getElementById('threat-logs');
                 logs.innerHTML = '';
                 
-                // Add sample threat log entries
-                const sampleThreats = [
-                    '[2024-01-20 10:35:25] SQL Injection attempt blocked from 192.168.1.100',
-                    '[2024-01-20 10:35:20] XSS pattern detected in request to /search',
-                    '[2024-01-20 10:35:15] Brute force attack detected - rate limited'
-                ];
-                
-                sampleThreats.forEach(threat => {
-                    const logEntry = document.createElement('div');
-                    logEntry.className = 'log-entry';
-                    logEntry.innerHTML = `<span class="log-timestamp log-level-warning">${threat}</span>`;
-                    logs.appendChild(logEntry);
-                });
+                // 0A.11: previously rendered three hardcoded back-dated threats
+                // (2024-01-20). Fetch REAL threats from /api/threats; when empty,
+                // show an honest empty-state line.
+                const result = await apiCall('/threats');
+                const threats = result.threats || [];
+                if (threats.length === 0) {
+                    const entry = document.createElement('div');
+                    entry.className = 'log-entry';
+                    entry.innerHTML = '<span class="log-timestamp">No threats detected.</span>';
+                    logs.appendChild(entry);
+                } else {
+                    threats.forEach(threat => {
+                        const logEntry = document.createElement('div');
+                        logEntry.className = 'log-entry';
+                        logEntry.innerHTML = `<span class="log-timestamp log-level-warning">[${threat.threat_type}] score=${threat.threat_score} confidence=${threat.confidence} @ ${threat.timestamp}</span>`;
+                        logs.appendChild(logEntry);
+                    });
+                }
                 
                 addLog('Threat log refreshed', 'info');
             } catch (error) {
@@ -2666,20 +2655,14 @@
             }
         }
         
-        function exportRules() {
+        async function exportRules() {
             try {
-                // Create a downloadable file with current rules
+                // 0A.11: previously exported a hardcoded fake rule with back-dated
+                // timestamps. Export the REAL active rules from /rules.
+                const result = await apiCall('/rules');
                 const rulesData = {
                     timestamp: new Date().toISOString(),
-                    rules: [
-                        {
-                            type: 'BLOCK_IP',
-                            content: 'deny 192.168.1.100;',
-                            priority: 'HIGH',
-                            created: '2024-01-20T10:30:15Z',
-                            expires: '2024-01-21T10:30:15Z'
-                        }
-                    ]
+                    rules: result.rules || result.active_rules || []
                 };
                 
                 const blob = new Blob([JSON.stringify(rulesData, null, 2)], { type: 'application/json' });
@@ -2703,11 +2686,14 @@
                 const result = await apiCall('/rules/stats');
                 const stats = result.rule_statistics;
                 
-                // Update rule categories
-                updateElement('block-ip-count', Math.floor(stats.active_rules * 0.6) || 0);
-                updateElement('rate-limit-count', Math.floor(stats.active_rules * 0.3) || 0);
-                updateElement('pattern-block-count', Math.floor(stats.active_rules * 0.2) || 0);
-                updateElement('geo-block-count', Math.floor(stats.active_rules * 0.1) || 0);
+                // 0A.11: /rules/stats reports total active_rules but does NOT break
+                // them down by category. Previously this fabricated four counts as
+                // fixed fractions of active_rules (0.6/0.3/0.2/0.1). A category the
+                // API does not measure is shown as "not measured", not invented.
+                updateElement('block-ip-count', 'not measured');
+                updateElement('rate-limit-count', 'not measured');
+                updateElement('pattern-block-count', 'not measured');
+                updateElement('geo-block-count', 'not measured');
                 
                 addLog('Rules list refreshed', 'info');
             } catch (error) {
@@ -2726,17 +2712,35 @@
             // Rules metrics
             await refreshRulesMetrics();
             
-            // Update threat type counts
-            updateElement('sql-injection-count', Math.floor(Math.random() * 10));
-            updateElement('xss-count', Math.floor(Math.random() * 7));
-            updateElement('brute-force-count', Math.floor(Math.random() * 5));
-            updateElement('anomalous-count', Math.floor(Math.random() * 3));
+            // Update threat type counts from REAL threat data (0A.11).
+            // Previously these were Math.random() — invented numbers. They now
+            // count actual threat_types from /api/threats; a type with no data
+            // shows 0, not a fabricated value.
+            try {
+                const threatResult = await apiCall('/threats');
+                const counts = { 'sql_injection': 0, 'xss_attack': 0, 'brute_force': 0 };
+                (threatResult.threats || []).forEach(t => {
+                    const ty = t.threat_type;
+                    if (ty === 'sql_injection') counts.sql_injection++;
+                    else if (ty === 'xss_attack') counts.xss_attack++;
+                    else if (ty === 'brute_force') counts.brute_force++;
+                    else counts.anomalous = (counts.anomalous || 0) + 1;
+                });
+                updateElement('sql-injection-count', counts.sql_injection);
+                updateElement('xss-count', counts.xss_attack);
+                updateElement('brute-force-count', counts.brute_force);
+                updateElement('anomalous-count', counts.anomalous || 0);
+            } catch (error) {
+                addLog('Threat counts unavailable', 'error');
+            }
             
-            // Update system metrics
-            updateMetric('status-uptime', '12h');
-            updateMetric('status-cpu', '45%');
-            updateMetric('status-memory', '1.2GB');
-            updateMetric('status-disk', '23%');
+            // System resource metrics (CPU/memory/disk/uptime) are NOT measured by
+            // the API (0A.11). They were hardcoded as 12h/45%/1.2GB/23%. Mark them
+            // "not measured" rather than display invented readings.
+            updateMetric('status-uptime', 'not measured');
+            updateMetric('status-cpu', 'not measured');
+            updateMetric('status-memory', 'not measured');
+            updateMetric('status-disk', 'not measured');
         }
         
         // Initialize when DOM is loaded
