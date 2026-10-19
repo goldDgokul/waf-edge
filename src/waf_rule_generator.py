@@ -7,6 +7,7 @@ Generates nginx WAF rules based on ML threat predictions.
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from datetime import datetime
+import ipaddress
 import json
 import re
 from loguru import logger
@@ -173,7 +174,8 @@ class WAFRuleGenerator:
             if count >= 5:  # Block IPs with 5+ threats
                 if self.should_generate_rule("block_ip", ip):
                     rule = self._generate_ip_block_rule(ip, count)
-                    new_rules.append(rule)
+                    if rule is not None:  # 0A.9: a non-IP source_ip is rejected
+                        new_rules.append(rule)
         
         # Generate rate limiting rules for high-volume attacks
         if sum(threat_patterns.values()) > 20:  # High threat volume
@@ -258,8 +260,26 @@ class WAFRuleGenerator:
         
         return None
     
-    def _generate_ip_block_rule(self, ip: str, threat_count: int) -> WAFRule:
+    def _generate_ip_block_rule(self, ip: str, threat_count: int) -> Optional[WAFRule]:
         """Generate IP blocking rule"""
+        # 0A.9: the only unescaped attacker-influenced value that reaches
+        # to_nginx_config is this IP, embedded as `if ($remote_addr = "{ip}")`.
+        # source_ip normally comes from nginx's $remote_addr (always a valid IP),
+        # but it is a free-form string, so a malformed or malicious value would be
+        # injected verbatim into the config. Reject anything that is not a single,
+        # valid IPv4/IPv6 address rather than emit it. A CIDR (e.g. "1.2.3.0/24")
+        # is also rejected: the block_ip rule now uses exact-match `=`, which does
+        # not match a CIDR string, so accepting it would emit a rule that never
+        # fires while looking like a block.
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            logger.warning(
+                f"Rejecting block_ip rule for non-IP condition {ip!r}: it would be "
+                f"embedded verbatim into nginx config."
+            )
+            return None
+
         self.rule_counter += 1
         
         return WAFRule(
