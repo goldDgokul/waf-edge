@@ -66,10 +66,14 @@ jobs:
         pytest tests/ -m "not docker" --ignore=tests/test_ssh_activation.py --cov=src --cov-report=xml
     
     - name: Upload coverage to Codecov
+      if: matrix.python-version == '3.10'
       uses: codecov/codecov-action@v3
       with:
         file: ./coverage.xml
-        fail_ci_if_error: true
+        # The pytest coverage floor above remains mandatory. Codecov is external
+        # reporting only: a tokenless 429 must not cancel tested matrix lanes or
+        # prevent docker-test from running.
+        fail_ci_if_error: false
 
   docker-test:
     runs-on: ubuntu-latest
