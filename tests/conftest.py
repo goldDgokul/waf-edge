@@ -21,6 +21,34 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# ---------------------------------------------------------------------------
+# 0A.7(b) — QUARANTINE the five uncollectable test files.
+#
+# These five files abort collection with ImportErrors for symbols that are
+# defined nowhere in src/ at any commit (local or upstream — verified across all
+# 77 commits). They describe an auth/rule interface the tenant redesign replaces:
+#   test_api_integration.py    -> from src.auth import create_access_token
+#   test_auth.py               -> from src.auth import create_access_token
+#   test_e2e_integration.py    -> from src.auth import create_access_token
+#   test_nginx_manager.py      -> from src.nginx_manager import DeploymentResult
+#   test_waf_rule_generator.py -> from src.waf_rule_generator import RuleAction
+#
+# They are QUARANTINED (excluded from collection), NOT deleted or repaired: the
+# repair-or-delete decision belongs with 0A.9 (the rule input-path redesign), and
+# deleting them now would pay twice. Keeping them on disk and named here keeps
+# the rot discoverable and attributed (upstream commit e92288c, 2025-07-21).
+#
+# Because collection now runs clean, a bare `pytest tests/` collects only the
+# tests that describe the code that actually exists.
+# ---------------------------------------------------------------------------
+collect_ignore = [
+    "test_api_integration.py",
+    "test_auth.py",
+    "test_e2e_integration.py",
+    "test_nginx_manager.py",
+    "test_waf_rule_generator.py",
+]
+
 # Basic test configuration
 @pytest.fixture
 def test_config():
