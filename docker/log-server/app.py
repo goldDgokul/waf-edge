@@ -19,10 +19,10 @@ LOG_PATH = os.getenv("LOG_PATH", "/logs/access.log")
 
 def parse_nginx_log_line(line: str) -> Optional[Dict]:
     """Parse nginx log line into structured data"""
-    # Nginx log format: IP - user [timestamp] "method url protocol" status size "referer" "user-agent" request_time upstream_time request_length bytes_sent [host]
-    # The final `host` is the Host header (customer/tenant identity), appended by
-    # the 0A.8 log-format change. It is captured from the trailing tail so the
-    # positional groups above are unchanged.
+    # Nginx log format: IP - user [timestamp] "method url protocol" status size "referer" "user-agent" request_time upstream_time request_length bytes_sent [host] [rule_id] [reason]
+    # The trailing tokens are (host, waf_rule_id, waf_reason), appended by the 0A.8
+    # and 0A.10 changes. They are read from the tail so the positional groups above
+    # are unchanged; absent values default to '' / '-'.
     pattern = r'^(\S+) - (\S+) \[([^\]]+)\] "([A-Z]+) ([^"]*) HTTP/[^"]*" (\d+) (\d+) "([^"]*)" "([^"]*)"(.*)'
     
     match = re.match(pattern, line.strip())
@@ -32,9 +32,11 @@ def parse_nginx_log_line(line: str) -> Optional[Dict]:
     try:
         groups = match.groups()
         timestamp_str = groups[2]
-        # The trailing tail is " <req_time> <upstream_time> <req_len> <bytes_sent> [host]".
+        # The trailing tail is " <req_time> <upstream_time> <req_len> <bytes_sent> <host> <rule_id> <reason>".
         tail = groups[9].strip().split()
         host = tail[4] if len(tail) >= 5 else ''
+        waf_rule_id = tail[5] if len(tail) >= 6 else '-'
+        waf_reason = tail[6] if len(tail) >= 7 else '-'
         
         # Parse timestamp
         try:
@@ -52,6 +54,8 @@ def parse_nginx_log_line(line: str) -> Optional[Dict]:
             "user_agent": groups[8],
             "source_ip": groups[0],
             "host": host,
+            "waf_rule_id": waf_rule_id,
+            "waf_reason": waf_reason,
             "headers": {
                 "user-agent": groups[8],
                 "referer": groups[7] if groups[7] != '-' else ''

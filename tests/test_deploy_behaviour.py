@@ -91,10 +91,10 @@ REAL_BASIC = REPO_ROOT / "docker" / "shared" / "waf-rules" / "basic.conf"
 # per-node include into the SAME shared volume, so an edit to node 2 was just as
 # capable of breaking the pipeline and passed silently.
 EXPECTED_SHA256 = {
-    REAL_NGINX_CONF: "7762365e2a866a0737c71d2ec211ddbf9ed1cbb66dccd0db7f986023b4127753",
-    REAL_VHOST: "26b10045bc16ea974245be2dac557f95443ed99a78b504d53ea43779f5043dd6",
-    REAL_NODE2_NGINX_CONF: "37c4b9f161563b0dbcef6ce59a780631b14186eac4b20d18d9f1f7f259976ccf",
-    REAL_NODE2_VHOST: "70098b2e851967c378891999e6020198f98adfe008078996b1a2aa88cb541e7c",
+    REAL_NGINX_CONF: "366a4a02038f2d8e7cdb130ae109d0fbd0b5450392b6ad9718a2c8896d4473fb",
+    REAL_VHOST: "f7d1f4c587997a2a463d8f46a6fb97a1b68cac49b4a299afdfca1a1d8180723d",
+    REAL_NODE2_NGINX_CONF: "84c3cf298a4626e6e5fa2a4d731634b5fe28f61bc5c27ae826044305352e3358",
+    REAL_NODE2_VHOST: "7ddb645e3aa4b40dc44ec1cb1e9bf77f43750866262cfe7eb51b050ea7f86ca6",
     REAL_BASIC: "2bbb037fa6ea42b34a1383e334cb7b7d3c7808f199642c25ca42a46784081924",
 }
 

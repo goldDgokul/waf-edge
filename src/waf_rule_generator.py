@@ -25,13 +25,41 @@ class WAFRule:
     expires_at: Optional[datetime] = None
     
     def to_nginx_config(self) -> str:
-        """Convert rule to nginx configuration format"""
+        """Convert rule to nginx configuration format."""
+        # 0A.10 (Option 1) - WAF-block attribution.
+        #
+        # Block rules no longer `return 403` inline. They `set` three variables
+        # ($waf_blocked, $waf_rule_id, $waf_reason) and a single trailing check in
+        # the vhost performs the actual `return`. This lets nginx BLOCK and MARK in
+        # one place, so the access log can carry the rule id + reason and a WAF 403
+        # is distinguishable from a backend's own 403. The variables are initialised
+        # to "0"/"-" at the top of the server block (default.conf), so an unmatched
+        # request leaves them at their sentinel values.
         if self.rule_type == "block_ip":
-            return f"deny {self.condition};"
+            # `deny` returns 403 at the access phase and cannot carry a marker or
+            # rule id. Convert to the set-form used by the other block types.
+            # NOTE: this generator emits single IPs (source_ip), never CIDR; a CIDR
+            # would still require `deny`, which is not wired here.
+            return (
+                f'if ($remote_addr = "{self.condition}") {{ '
+                f'set $waf_blocked "403"; '
+                f'set $waf_rule_id "{self.rule_id}"; '
+                f'set $waf_reason "block_ip"; }}'
+            )
         elif self.rule_type == "block_url_pattern":
-            return f'if ($request_uri ~ "{self.condition}") {{ return 403; }}'
+            return (
+                f'if ($request_uri ~ "{self.condition}") {{ '
+                f'set $waf_blocked "403"; '
+                f'set $waf_rule_id "{self.rule_id}"; '
+                f'set $waf_reason "block_url_pattern"; }}'
+            )
         elif self.rule_type == "block_user_agent":
-            return f'if ($http_user_agent ~ "{self.condition}") {{ return 403; }}'
+            return (
+                f'if ($http_user_agent ~ "{self.condition}") {{ '
+                f'set $waf_blocked "403"; '
+                f'set $waf_rule_id "{self.rule_id}"; '
+                f'set $waf_reason "block_user_agent"; }}'
+            )
         elif self.rule_type == "rate_limit":
             # Only ever emit a zone we created ourselves.
             #
