@@ -7,6 +7,9 @@ measures response times, and tests resource utilization.
 """
 
 import pytest
+# 0A.7: whole suite marked slow (live HTTP timing / load loops = >5s), so
+# `-m "not slow"` can deselect it explicitly; CI keeps running it today.
+pytestmark = pytest.mark.slow
 import asyncio
 import time
 import statistics

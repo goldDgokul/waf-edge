@@ -1,6 +1,10 @@
-# Core testing framework
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
+﻿# Core testing framework
+# 0A.7: bounded ranges, not open floors. requirements.txt pins the app incl.
+# pytest==7.4.3 and CI installs this file second, so the test toolchain range
+# must be compatible with that pin; the >=0.23 floor is the first asyncio
+# plugin line with pytest 8/9 support.
+pytest>=7.4,<10
+pytest-asyncio>=0.23
 pytest-cov>=4.0.0
 pytest-mock>=3.10.0
 pytest-xdist>=3.0.0  # For parallel test execution

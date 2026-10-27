@@ -132,14 +132,15 @@ class TestRunner:
         """Run unit tests only"""
         print("🧪 Running Unit Tests")
         print("=" * 50)
-        
+
+        # 0A.7: the five upstream files this script used to launch by explicit
+        # path import names that never existed (see tests/conftest.py) and are
+        # quarantined. Explicit paths bypass collect_ignore, so selection is
+        # now marker-based like CI.
         cmd = [
             "python", "-m", "pytest",
-            str(self.tests_dir / "test_auth.py"),
-            str(self.tests_dir / "test_ml_engine.py"),
-            str(self.tests_dir / "test_traffic_collector.py"),
-            str(self.tests_dir / "test_waf_rule_generator.py"),
-            str(self.tests_dir / "test_nginx_manager.py"),
+            str(self.tests_dir),
+            "-m", "not docker",
             "-v" if verbose else "-q",
             "--tb=short"
         ]
@@ -167,11 +168,12 @@ class TestRunner:
         
         cmd = [
             "python", "-m", "pytest",
-            str(self.tests_dir / "test_api_integration.py"),
+            str(self.tests_dir),
+            "-m", "not docker",
             "-v" if verbose else "-q",
             "--tb=short"
         ]
-        
+
         try:
             result = subprocess.run(cmd, cwd=self.project_root)
             return result.returncode
@@ -193,7 +195,8 @@ class TestRunner:
         
         cmd = [
             "python", "-m", "pytest",
-            str(self.tests_dir / "test_e2e_integration.py"),
+            str(self.tests_dir),
+            "-m", "docker",
             "-v" if verbose else "-q",
             "--tb=short",
             "-s"  # Don't capture output for e2e tests
