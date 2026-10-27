@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, status, Request, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, status, Request, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -36,7 +36,7 @@ except ImportError:
     RATE_LIMITING_AVAILABLE = False
 
 # Import our modules
-from .auth import auth_manager
+from .auth import auth_manager, require_admin, require_operator, require_viewer
 from .validation import (
     SecureNginxNodeModel, SecureTrainingRequest, SecureRuleDeploymentRequest,
     UserManagementRequest, LoginRequest, ApiKeyRequest, ValidationError
@@ -122,35 +122,23 @@ async def lifespan(app: FastAPI):
                 system_state['last_error'] = str(e)
 
 
-# Create FastAPI app with security middleware
+# 0A.6: OpenAPI schema and docs pages are not served at all. The schema
+# previously disclosed the whole private route table on a public path.
 app = FastAPI(
     title="Nginx WAF AI",
     description="Real-time machine learning WAF rule generator for nginx",
     version="0.1.0",
     lifespan=lifespan,
-    docs_url="/docs" if config.api_debug else None,  # Disable docs in production
-    redoc_url="/redoc" if config.api_debug else None
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
 )
 
 # CORS middleware configuration for development and production
-cors_origins = config.security.cors_origins if config.security.cors_origins else [
-    "http://localhost",       # UI on localhost:80
-    "http://localhost:80",    # Explicit port 80
-    "http://localhost:3000",  # React dev server
-    "http://localhost:8080",  # Vue dev server
-    "http://localhost:5173",  # Vite dev server
-    "http://localhost:4200",  # Angular dev server
-    "http://127.0.0.1",       # UI on 127.0.0.1:80
-    "http://127.0.0.1:80",    # Explicit port 80
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:8080", 
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:4200",
-    # Add file:// protocol for direct file access (if needed)
-    "file://",
-    # Add production CORS origins - only Grafana allowed
-    "null"
-]
+# 0A.6: the origin allowlist comes from config (WAF_CORS_ORIGINS env). The
+# previous permissive fallback list granted credentialed requests from the
+# "null" origin (sandboxed frames) and file:// — both removed.
+cors_origins = config.security.cors_origins or []
 
 app.add_middleware(
     CORSMiddleware,
@@ -557,11 +545,12 @@ async def shutdown_components():
 # Authentication endpoints disabled for development speed
 # Will be re-enabled later
 
-# @app.post("/auth/login", response_model=AuthResponse)
-async def login(request: LoginRequest):
-    """Authenticate user and return JWT token"""
+@app.post("/auth/login", response_model=AuthResponse)
+@rate_limit("5/minute")
+async def login(request: Request, login_request: LoginRequest):
+    """Authenticate user and return JWT token (5 attempts/min per client IP)"""
     try:
-        user = auth_manager.authenticate_user(request.username, request.password)
+        user = auth_manager.authenticate_user(login_request.username, login_request.password)
         if not user:
             metrics.auth_attempts.labels(status="failed").inc()
             raise HTTPException(
@@ -579,6 +568,8 @@ async def login(request: LoginRequest):
             expires_in=config.security.jwt_expiry_hours * 3600
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Login error: {e}")
         metrics.auth_attempts.labels(status="error").inc()
@@ -602,7 +593,7 @@ async def generate_api_key(
         raise HTTPException(status_code=500, detail="Failed to generate API key")
 
 
-@app.post("/auth/users")
+@app.post("/auth/users", dependencies=[require_admin()])
 async def create_user(
     request: UserManagementRequest
 ):
@@ -624,7 +615,7 @@ async def create_user(
         raise HTTPException(status_code=500, detail="Failed to create user")
 
 
-@app.get("/auth/users")
+@app.get("/auth/users", dependencies=[require_admin()])
 async def list_users(request: Request):
     """List all users (admin only)"""
     try:
@@ -636,7 +627,7 @@ async def list_users(request: Request):
 
 # ============= SECURITY MANAGEMENT ENDPOINTS =============
 
-@app.get("/api/security/stats")
+@app.get("/api/security/stats", dependencies=[require_admin()])
 async def get_security_stats():
     """Get security statistics and events (admin only)"""
     try:
@@ -666,7 +657,7 @@ async def get_security_stats():
         raise HTTPException(status_code=500, detail="Failed to get security stats")
 
 
-@app.post("/api/security/unblock-ip")
+@app.post("/api/security/unblock-ip", dependencies=[require_admin()])
 async def unblock_ip(
     ip_address: str = Query(..., description="IP address to unblock")
 ):
@@ -691,7 +682,7 @@ async def unblock_ip(
         raise HTTPException(status_code=500, detail="Failed to unblock IP")
 
 
-@app.post("/api/security/emergency-shutdown")
+@app.post("/api/security/emergency-shutdown", dependencies=[require_admin()])
 async def emergency_shutdown():
     """Emergency shutdown endpoint (admin only)"""
     try:
@@ -716,36 +707,8 @@ async def emergency_shutdown():
 
 
 # ============= PUBLIC ENDPOINTS =============
-
-@app.get("/test-no-auth")
-async def test_no_auth():
-    """Simple test endpoint with no authentication"""
-    return {"message": "This endpoint should work without auth", "timestamp": datetime.now().isoformat()}
-
-@app.get("/api/debug/traffic-collector")
-async def debug_traffic_collector():
-    """Debug endpoint to check traffic collector state"""
-    traffic_collector = component_manager.get_component('traffic_collector')
-    if not traffic_collector:
-        return {"error": "Traffic collector not found"}
-    
-    recent_requests = traffic_collector.get_recent_requests(10)
-    
-    return {
-        "total_collected_requests": len(traffic_collector.collected_requests),
-        "recent_requests_count": len(recent_requests),
-        "recent_requests_sample": [
-            {
-                "method": req.method,
-                "url": req.url,
-                "timestamp": req.timestamp.isoformat(),
-                "node_id": req.node_id
-            } for req in recent_requests[:3]
-        ],
-        "is_collecting": traffic_collector.is_collecting,
-        "timestamp": datetime.now().isoformat()
-    }
-
+# (0A.6: the dev-only /test-no-auth probe and the /api/debug/ routes were
+# closed — see ROUTE-POLICY-0A6.txt. The panel consumes /api/panel-status.)
 
 @app.get("/")
 async def root():
@@ -827,9 +790,9 @@ async def get_metrics():
 
 # ============= PROTECTED ENDPOINTS =============
 
-@app.get("/api/debug/status")
-async def debug_status():
-    """Debug endpoint to check system status (admin only)"""
+@app.get("/api/panel-status", dependencies=[require_viewer()])
+async def panel_status():
+    """Aggregated runtime status for the control panel (replaces /api/debug/status)"""
     
     # Get components safely using component manager
     traffic_collector = component_manager.get_component('traffic_collector')
@@ -863,7 +826,7 @@ async def debug_status():
     return status
 
 
-@app.get("/api/status")
+@app.get("/api/status", dependencies=[require_viewer()])
 async def get_system_status():
     """Get system status - requires authentication"""
     # Get components safely
@@ -891,7 +854,7 @@ async def get_system_status():
     }
 
 
-@app.get("/api/health")
+@app.get("/api/health", dependencies=[require_viewer()])
 async def get_system_health():
     """Get comprehensive system health including error recovery status"""
     try:
@@ -943,7 +906,7 @@ async def get_system_health():
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
 
-@app.post("/api/nodes/add")
+@app.post("/api/nodes/add", dependencies=[require_admin()])
 async def add_nginx_node(
     node: SecureNginxNodeModel
 ):
@@ -978,7 +941,7 @@ async def add_nginx_node(
         raise HTTPException(status_code=500, detail=f"Failed to add node: {str(e)}")
 
 
-@app.get("/api/nodes")
+@app.get("/api/nodes", dependencies=[require_viewer()])
 async def list_nginx_nodes():
     """List all nginx nodes - viewer role or higher required"""
     nginx_manager = component_manager.get_component('nginx_manager')
@@ -991,7 +954,7 @@ async def list_nginx_nodes():
     }
 
 
-@app.get("/api/nodes/status")
+@app.get("/api/nodes/status", dependencies=[require_viewer()])
 async def get_cluster_status():
     """Get status of all nginx nodes - requires authentication"""
     nginx_manager = component_manager.get_component('nginx_manager')
@@ -1006,7 +969,7 @@ async def get_cluster_status():
         raise HTTPException(status_code=500, detail=f"Failed to get cluster status: {str(e)}")
 
 
-@app.post("/api/training/start")
+@app.post("/api/training/start", dependencies=[require_operator()])
 async def start_training():
     """Start ML model training - operator role or higher required"""
     ml_engine = component_manager.get_component('ml_engine')
@@ -1067,7 +1030,7 @@ async def start_training():
         raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
 
 
-@app.post("/api/traffic/start-collection")
+@app.post("/api/traffic/start-collection", dependencies=[require_operator()])
 async def start_traffic_collection(
     node_urls: List[str]
 ):
@@ -1100,7 +1063,7 @@ async def start_traffic_collection(
         raise HTTPException(status_code=500, detail=f"Failed to start traffic collection: {str(e)}")
 
 
-@app.get("/api/traffic/stats")
+@app.get("/api/traffic/stats", dependencies=[require_viewer()])
 async def get_traffic_stats():
     """Get traffic collection statistics - viewer role or higher required"""
     traffic_collector = component_manager.get_component('traffic_collector')
@@ -1122,7 +1085,7 @@ async def get_traffic_stats():
         raise HTTPException(status_code=500, detail=f"Failed to get traffic stats: {str(e)}")
 
 
-@app.post("/api/processing/start")
+@app.post("/api/processing/start", dependencies=[require_operator()])
 async def start_real_time_processing():
     """Start real-time processing of traffic"""
     logger.info("API ENDPOINT: Starting real-time processing...")
@@ -1428,7 +1391,7 @@ async def process_threats_continuously():
     logger.info("THREAT PROCESSOR: Threat processing loop ended!")
 
 
-@app.get("/api/threats")
+@app.get("/api/threats", dependencies=[require_viewer()])
 async def get_recent_threats() -> ThreatResponse:
     """Get recent threat detections - viewer role or higher required"""
     real_time_processor = component_manager.get_component('real_time_processor')
@@ -1465,7 +1428,7 @@ async def get_recent_threats() -> ThreatResponse:
     )
 
 
-@app.get("/api/rules")
+@app.get("/api/rules", dependencies=[require_viewer()])
 async def get_active_rules():
     """Get currently active WAF rules - viewer role or higher required"""
     waf_rule_generator = component_manager.get_component('waf_rule_generator')
@@ -1481,7 +1444,7 @@ async def get_active_rules():
     }
 
 
-@app.post("/api/rules/deploy")
+@app.post("/api/rules/deploy", dependencies=[require_operator()])
 async def deploy_rules(
     request: SecureRuleDeploymentRequest
 ):
@@ -1705,7 +1668,7 @@ async def deploy_rules(
         raise HTTPException(status_code=500, detail=f"Deployment error: {str(e)}")
 
 
-@app.get("/api/config/nginx")
+@app.get("/api/config/nginx", dependencies=[require_operator()])
 async def get_nginx_config():
     """Generate and return nginx configuration - requires operator role"""
     waf_rule_generator = component_manager.get_component('waf_rule_generator')
@@ -1728,7 +1691,7 @@ async def get_nginx_config():
         raise HTTPException(status_code=500, detail=f"Failed to generate nginx config: {str(e)}")
 
 
-@app.get("/api/rules/stats")
+@app.get("/api/rules/stats", dependencies=[require_viewer()])
 async def get_rule_stats():
     """Get WAF rule generation and management statistics"""
     waf_rule_generator = component_manager.get_component('waf_rule_generator')
@@ -1755,7 +1718,7 @@ async def get_rule_stats():
         raise HTTPException(status_code=500, detail=f"Failed to get rule stats: {str(e)}")
 
 
-@app.post("/api/rules/cleanup")
+@app.post("/api/rules/cleanup", dependencies=[require_operator()])
 async def cleanup_rules():
     """Manually trigger rule cleanup (remove expired rules)"""
     waf_rule_generator = component_manager.get_component('waf_rule_generator')
@@ -1779,7 +1742,7 @@ async def cleanup_rules():
         raise HTTPException(status_code=500, detail=f"Failed to cleanup rules: {str(e)}")
 
 
-@app.post("/api/rules/configure")
+@app.post("/api/rules/configure", dependencies=[require_operator()])
 async def configure_rule_limits(
     max_rules: Optional[int] = None,
     default_expiry_minutes: Optional[int] = None
@@ -1811,7 +1774,7 @@ async def configure_rule_limits(
         raise HTTPException(status_code=500, detail=f"Failed to configure rules: {str(e)}")
 
 
-@app.delete("/api/rules/expire")
+@app.delete("/api/rules/expire", dependencies=[require_operator()])
 async def expire_rules(
     rule_ids: Optional[List[str]] = None,
     rule_types: Optional[List[str]] = None
@@ -1839,7 +1802,7 @@ async def expire_rules(
         raise HTTPException(status_code=500, detail=f"Failed to expire rules: {str(e)}")
 
 
-@app.post("/api/processing/stop")
+@app.post("/api/processing/stop", dependencies=[require_operator()])
 async def stop_processing():
     """Stop real-time processing - requires operator role"""
     try:
@@ -1865,7 +1828,7 @@ async def stop_processing():
         raise HTTPException(status_code=500, detail=f"Failed to stop processing: {str(e)}")
 
 
-@app.get("/api/stats")
+@app.get("/api/stats", dependencies=[require_viewer()])
 async def get_system_stats():
     """Get overall system statistics - viewer role or higher required"""
     try:

@@ -1,0 +1,12 @@
+# Offline rebuild helper (build network is currently failing on PyPI).
+# Base is the previously built, dependency-verified waf-api image; only the
+# application source layers are replaced, so the code shipped here is the
+# current working tree with the 0A.6 changes while pip/apt stay untouched.
+# shortcut: delete when plain `docker compose build waf-api` works again.
+FROM nginxwafai-waf-api:latest
+
+WORKDIR /app
+
+COPY src/ src/
+COPY cli.py .
+COPY run_server.py .

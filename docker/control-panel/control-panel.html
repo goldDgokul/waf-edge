@@ -1033,9 +1033,77 @@
                 justify-content: center;
             }
         }
+
+        /* 0A.6 login gate: the panel waits for a real login before talking
+           to the API. Same-origin POST to /api/auth/login via the nginx proxy. */
+        .login-overlay {
+            position: fixed;
+            inset: 0;
+            background: var(--dark-bg, #0f172a);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .login-box {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 2rem;
+            width: min(360px, 90vw);
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        .login-box h2 {
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1.25rem;
+        }
+        .login-box label {
+            font-size: 0.85rem;
+            opacity: 0.8;
+        }
+        .login-box input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 0.6rem 0.75rem;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            background: rgba(0, 0, 0, 0.3);
+            color: inherit;
+            font: inherit;
+        }
+        .login-error {
+            color: #f87171;
+            font-size: 0.85rem;
+            min-height: 1.2em;
+            margin: 0;
+        }
+        .login-box[hidden] {
+            display: none;
+        }
+        .login-overlay[hidden] {
+            display: none;
+        }
     </style>
 </head>
 <body>
+    <!-- 0A.6: no inherited status is shown or fetched before login succeeds -->
+    <div id="login-form" class="login-overlay">
+        <div class="login-box">
+            <h2><span>🛡️</span> WAF AI — Control Center</h2>
+            <label for="login-username">Username</label>
+            <input id="login-username" name="username" autocomplete="username" required>
+            <label for="login-password">Password</label>
+            <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+            <p id="login-error" class="login-error"></p>
+            <button class="btn" type="button" onclick="doLogin()">Sign in</button>
+        </div>
+    </div>
+
     <div class="app-layout">
         <!-- Sidebar -->
         <nav class="sidebar">
@@ -2186,13 +2254,69 @@
             }
         }
         
+        // 0A.6 login and bearer-token plumbing ------------------------------
+        const WAF_TOKEN_KEY = 'waf_api_token';
+
+        function getToken() {
+            return localStorage.getItem(WAF_TOKEN_KEY);
+        }
+
+        function showLogin(message = '') {
+            document.getElementById('login-form').hidden = false;
+            document.getElementById('login-error').textContent = message;
+            if (message) addLog(message, 'error');
+        }
+
+        function hideLogin() {
+            document.getElementById('login-form').hidden = true;
+            document.getElementById('login-error').textContent = '';
+        }
+
+        async function doLogin() {
+            const loginErr = document.getElementById('login-error');
+            loginErr.textContent = '';
+            const username = document.getElementById('login-username').value.trim();
+            const password = document.getElementById('login-password').value;
+            try {
+                const response = await fetch('/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                if (response.status === 401) {
+                    showLogin('Invalid username or password.');
+                    return;
+                }
+                if (response.status === 429) {
+                    showLogin('Too many login attempts — wait a minute and try again.');
+                    return;
+                }
+                if (!response.ok) {
+                    showLogin(`Login unavailable (HTTP ${response.status}). Check the API is running.`);
+                    return;
+                }
+                const payload = await response.json();
+                localStorage.setItem(WAF_TOKEN_KEY, payload.access_token);
+                hideLogin();
+                addLog(`Logged in as ${username}`, 'success');
+                refreshAllStatus();
+            } catch (error) {
+                showLogin(`Login failed: ${error.message}`);
+            }
+        }
+
         async function apiCall(endpoint, method = 'GET', data = null) {
             try {
+                const token = getToken();
+                const headers = {
+                    'Content-Type': 'application/json',
+                };
+                if (token) {
+                    headers['Authorization'] = `Bearer ${token}`;
+                }
                 const options = {
                     method,
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers,
                 };
                 
                 if (data) {
@@ -2201,7 +2325,14 @@
                 
                 const response = await fetch(`${API_BASE}${endpoint}`, options);
                 
+                if (response.status === 401) {
+                    showLogin();
+                    throw new Error('HTTP 401: signed out — sign in again to continue');
+                }
                 if (!response.ok) {
+                    if (response.status === 429) {
+                        addLog('Rate limited (HTTP 429) — retry in a minute', 'error');
+                    }
                     const errorText = await response.text();
                     throw new Error(`HTTP ${response.status}: ${errorText}`);
                 }
@@ -2244,7 +2375,7 @@
 
         async function getTrafficStatus() {
             try {
-                const result = await apiCall('/debug/status');
+                const result = await apiCall('/panel-status');
                 const collector = result.traffic_collector;
                 const status = collector.is_collecting ? 'running' : 'stopped';
                 const text = collector.is_collecting ? 'Running' : 'Stopped';
@@ -2278,7 +2409,7 @@
 
         async function getMLStatus() {
             try {
-                const result = await apiCall('/debug/status');
+                const result = await apiCall('/panel-status');
                 const mlEngine = result.ml_engine;
                 addLog(`ML Status: Initialized=${mlEngine.initialized}, Trained=${mlEngine.is_trained}`, 'info');
                 if (mlEngine.initialized && mlEngine.is_trained) {
@@ -2319,7 +2450,7 @@
         
         async function getThreatStatus() {
             try {
-                const result = await apiCall('/debug/status');
+                const result = await apiCall('/panel-status');
                 const processing = result.processing;
                 const status = processing.is_processing ? 'running' : 'stopped';
                 const text = processing.is_processing ? 'Active' : 'Stopped';
@@ -2510,14 +2641,22 @@
         // Initialize the application
         function initializeApp() {
             addLog('Initializing WAF AI Control Panel...', 'info');
+            
+            // 0A.6: the app starts on the login gate; the API is only polled
+            // after a successful login (or with an existing valid bearer token).
+            if (getToken()) {
+                hideLogin();
+                startAppPolling();
+            } else {
+                showLogin();
+            }
+        }
+
+        function startAppPolling() {
             addLog('API connection established', 'success');
-            
-            // Refresh all status on load
             refreshAllStatus();
-            
             // Set up auto-refresh every 30 seconds
             setInterval(refreshAllStatus, 30000);
-            
             addLog('Ready for user commands', 'success');
         }
         
@@ -2537,7 +2676,7 @@
         // Traffic Control Functions
         async function refreshTrafficLog() {
             try {
-                const result = await apiCall('/debug/status');
+                const result = await apiCall('/panel-status');
                 const logs = document.getElementById('traffic-logs');
                 logs.innerHTML = '';
                 
@@ -2575,7 +2714,7 @@
         
         async function getMLModelInfo() {
             try {
-                const result = await apiCall('/debug/status');
+                const result = await apiCall('/panel-status');
                 const mlEngine = result.ml_engine;
                 
                 // 0A.11: /debug/status reports only `initialized` and `is_trained`.
@@ -2743,8 +2882,10 @@
             updateMetric('status-disk', 'not measured');
         }
         
-        // Initialize when DOM is loaded
-        document.addEventListener('DOMContentLoaded', initializeApp);
+        // 0A.6: the DOMContentLoaded listener above was replaced — the panel
+        // boots straight into the login gate and only polls the API after a
+        // successful sign-in (or an existing valid bearer token).
+        initializeApp();
     </script>
 </body>
 </html>

@@ -195,7 +195,11 @@ class AuthManager:
             roles = payload.get('roles', [])
             exp = datetime.fromtimestamp(payload.get('exp'))
             
-            if username and username in self.users:
+            # 0A.6: tokens are verified statelessly (signature + expiry); the
+            # bearer identity does not require a live user-registry hit, so a
+            # deleted user's token still authenticates until expiry. Trade-off
+            # recorded in docs/adr/0001-jwt-verified-statelessly.md.
+            if username:
                 return TokenData(username=username, roles=roles, exp=exp)
         except jwt.ExpiredSignatureError:
             logger.warning("JWT token expired")
@@ -231,9 +235,19 @@ class AuthManager:
     
     async def get_current_user_from_token(
         self, 
-        credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+        credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))
     ) -> TokenData:
         """Get current user from JWT token"""
+        # 0A.6: HTTPBearer(auto_error=True) answered a missing Authorization
+        # header with 403; the route policy requires 401 for missing and
+        # invalid credentials alike, so the bearer dependency tolerates a
+        # missing header and we raise the correct 401 here.
+        if credentials is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing authorization token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         token = credentials.credentials
         
         # Try JWT first
@@ -281,7 +295,7 @@ auth_manager = AuthManager()
 
 # Dependency functions for FastAPI
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))
 ) -> TokenData:
     """Get current authenticated user"""
     return await auth_manager.get_current_user_from_token(credentials)

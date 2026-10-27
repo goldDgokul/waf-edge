@@ -1,7 +1,8 @@
 # Issue tracker: GitHub
 
 Issues and specs for this repo live as GitHub issues, in
-`Networker-s-Home/waf-edge`.
+`goldDgokul/waf-edge`. (Migrated from the old org repo
+`Networker-s-Home/waf-edge` on 2026-10-27; do not create issues there.)
 
 ## Tooling note
 

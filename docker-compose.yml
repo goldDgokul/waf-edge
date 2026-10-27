@@ -33,6 +33,12 @@ services:
     container_name: waf-api
     ports:
       - "8000:8000"
+    # 0A.6: the operator's own .env (gitignored) supplies optional auth
+    # credentials (WAF_ADMIN_PASSWORD, WAF_JWT_SECRET). Variables absent
+    # from the file are not injected, so the in-app fallbacks keep working.
+    env_file:
+      - path: .env
+        required: false
     environment:
       - REDIS_URL=redis://redis:6379
       - LOG_LEVEL=INFO

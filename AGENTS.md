@@ -6,7 +6,7 @@ Guidance for coding agents working in this repository.
 
 ### Issue tracker
 
-Issues live as GitHub issues in `Networker-s-Home/waf-edge`. See `docs/agents/issue-tracker.md`.
+Issues live as GitHub issues in `goldDgokul/waf-edge`. See `docs/agents/issue-tracker.md`.
 
 ### Domain docs
 
