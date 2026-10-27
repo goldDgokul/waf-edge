@@ -1,0 +1,86 @@
+PHASE 0A.6 — API ROUTE ACCESS POLICY
+=====================================
+Measured from: src/main.py and the registered FastAPI app at commit af8dc0b1311cfc3dd760354acae420d9fe7fa9df
+Measured: 2026-10-19 17:22 IST
+
+COUNT
+-----
+30 custom routes are currently registered by src/main.py.
+FastAPI also registers /openapi.json, so the current runtime route table has 31 paths.
+/auth/login is required but currently not registered. After implementation, the intended route table has 32 paths.
+
+POLICY DEFINITIONS
+------------------
+Public   No token required. Contains only service discovery, liveness, monitoring or login.
+Viewer   Any authenticated viewer/operator/admin. Read-only operational data.
+Operator Authenticated operator/admin. Starts, stops, configures, generates or deploys operational state.
+Admin    Authenticated admin only. User, security and cluster membership administration.
+Closed   Must not be registered or served in the production application.
+
+PUBLIC (4 intended; 3 currently registered)
+------------------------------------------
+GET  /                         Service identity/status only. Currently registered.
+GET  /health                   Public liveness/readiness endpoint. Currently registered.
+GET  /metrics                  Public monitoring endpoint. Currently registered.
+POST /auth/login               Credential exchange, rate limited. REQUIRED, currently not registered.
+
+VIEWER (9)
+----------
+GET  /api/status               Read-only system status.
+GET  /api/health               Read-only detailed health; repair current 500 behavior.
+GET  /api/nodes                Read-only node inventory.
+GET  /api/nodes/status         Read-only node health/status.
+GET  /api/traffic/stats        Read-only traffic collection statistics.
+GET  /api/threats              Read-only detected-threat data; does not imply active blocking.
+GET  /api/rules                Read-only active-rule inventory.
+GET  /api/rules/stats          Read-only rule statistics.
+GET  /api/stats                Read-only aggregate statistics.
+
+OPERATOR (9)
+------------
+POST   /api/training/start             Starts model training. Authorization only in 0A.6; ML remediation remains deferred.
+POST   /api/traffic/start-collection   Changes traffic collection runtime state.
+POST   /api/processing/start           Starts real-time processing.
+POST   /api/rules/deploy               Deploys rules and reloads Nginx nodes.
+GET    /api/config/nginx               Generates and exposes active Nginx configuration.
+POST   /api/rules/cleanup              Removes expired/old rules.
+POST   /api/rules/configure            Changes rule limits and expiry configuration.
+DELETE /api/rules/expire               Removes selected rules.
+POST   /api/processing/stop            Stops real-time processing.
+
+ADMIN (6)
+---------
+POST /auth/users                       Creates users and assigns roles.
+GET  /auth/users                       Lists users and authentication statistics.
+GET  /api/security/stats               Exposes security/authentication statistics.
+POST /api/security/unblock-ip          Changes IP-blocking/security state.
+POST /api/security/emergency-shutdown  Stops processing through the emergency control path.
+POST /api/nodes/add                     Changes cluster membership and SSH deployment targets.
+
+CLOSED (4)
+----------
+GET/HEAD /openapi.json                 Framework schema disclosure; currently registered despite disabled /docs and /redoc.
+GET      /test-no-auth                  Development-only authentication bypass probe.
+GET      /api/debug/traffic-collector  Debug data exposure.
+GET      /api/debug/status             Debug data exposure used by the current panel; panel must move to protected non-debug APIs.
+
+CURRENT ENFORCEMENT BASELINE
+----------------------------
+Registered paths with route dependencies: 0 of 31.
+All 31 registered paths currently report dependency_count=0 in the FastAPI route table.
+/auth/login is absent.
+The control panel proxies /api/ with wildcard Access-Control-Allow-Origin and does not expose an /auth/ proxy.
+The served panel makes protected API calls before any login flow exists.
+
+0A.6 ACCEPTANCE BOUNDARY
+------------------------
+1. Public routes remain reachable without a token.
+2. Missing/invalid credentials on Viewer, Operator and Admin routes return 401.
+3. Authenticated users below the route's role return 403.
+4. Excessive login attempts return 429.
+5. Closed routes are not registered/served.
+6. /api/health returns a truthful non-500 response under expected degraded conditions.
+7. Credential-bearing wildcard CORS is removed from both FastAPI and the control-panel proxy.
+8. The panel cannot request protected data before login and sends the bearer token after login.
+9. This minimal login is a Phase 0A control-plane guard, not the final multi-tenant identity system.
+10. ML remediation remains deferred; adding authorization to /api/training/start does not authorize starting ML remediation work.
