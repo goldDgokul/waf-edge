@@ -43,7 +43,7 @@ from .validation import (
 )
 from .config import config
 from .traffic_collector import TrafficCollector, HttpRequest
-from .ml_engine import MLEngine, RealTimeProcessor, ThreatPrediction
+from .ml_engine import MLEngine, RealTimeProcessor, ThreatPrediction, is_threat
 from .waf_rule_generator import WAFRuleGenerator, WAFRule, RuleOptimizer
 from .nginx_manager import NginxManager, NginxNode
 from .security_middleware import SecurityMiddleware, is_ip_whitelisted
@@ -501,7 +501,9 @@ async def startup_components():
                 ml_engine = component_manager.get_component('ml_engine')
                 if ml_engine:
                     logger.info("Initializing real-time processor...")
-                    real_time_processor = RealTimeProcessor(ml_engine, config.threat_threshold)
+                    real_time_processor = RealTimeProcessor(
+                        ml_engine, config.threat_threshold, config.confidence_threshold
+                    )
                     component_manager.set_component('real_time_processor', real_time_processor)
                 else:
                     logger.warning("ML engine not available, skipping real-time processor")
@@ -1246,7 +1248,7 @@ async def process_traffic_continuously():
                                 status = '403'
                             elif 'nonexistent' in request.url:
                                 status = '404'
-                            elif prediction and (prediction.threat_score < -0.1 or prediction.confidence > 0.6):
+                            elif prediction and is_threat(prediction, config.threat_threshold, config.confidence_threshold):
                                 status = '403'  # Block threats
                             
                             # Increment metrics
@@ -1254,7 +1256,7 @@ async def process_traffic_continuously():
                             metrics.requests_total.labels(node_id=node_id, status=status).inc()
                             
                             # Check for threats with updated threshold
-                            if prediction and (prediction.threat_score < -0.1 or prediction.confidence > 0.6 or prediction.threat_type != 'normal'):
+                            if prediction and is_threat(prediction, config.threat_threshold, config.confidence_threshold):
                                 threat_type = prediction.threat_type
                                 if threat_type == 'normal':
                                     # Override with pattern-based detection

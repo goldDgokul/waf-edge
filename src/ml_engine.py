@@ -452,65 +452,6 @@ class MLEngine:
                 self.is_trained = False
                 raise
     
-    def predict_threats(self, requests: List[Dict]) -> List[ThreatPrediction]:
-        """Predict threats for incoming requests"""
-        if not self.is_trained:
-            raise ValueError("Models must be trained before making predictions")
-        
-        predictions = []
-        
-        # Extract features
-        X = self.extract_features(requests)
-        X_scaled = self.scaler.transform(X)
-        
-        # Get anomaly scores
-        anomaly_scores = self.anomaly_detector.decision_function(X_scaled)
-        is_anomaly = self.anomaly_detector.predict(X_scaled)
-        
-        # Get threat classifications
-        threat_probs = self.threat_classifier.predict_proba(X_scaled)
-        threat_classes = self.threat_classifier.predict(X_scaled)
-        
-        for i, req in enumerate(requests):
-            threat_type = self.label_encoder.inverse_transform([threat_classes[i]])[0]
-            confidence = max(threat_probs[i])
-            
-            prediction = ThreatPrediction(
-                request_id=f"req_{i}_{datetime.now().timestamp()}",
-                threat_score=float(anomaly_scores[i]),
-                threat_type=threat_type,
-                confidence=float(confidence),
-                features_used=self.feature_columns,
-                timestamp=datetime.now()
-            )
-            predictions.append(prediction)
-        
-        return predictions
-    
-    def save_models(self, model_path: str):
-        """Save trained models to disk"""
-        model_data = {
-            'anomaly_detector': self.anomaly_detector,
-            'threat_classifier': self.threat_classifier,
-            'scaler': self.scaler,
-            'label_encoder': self.label_encoder,
-            'feature_columns': self.feature_columns,
-            'is_trained': self.is_trained
-        }
-        joblib.dump(model_data, model_path)
-        print(f"Models saved to {model_path}")
-    
-    def load_models(self, model_path: str):
-        """Load trained models from disk"""
-        model_data = joblib.load(model_path)
-        self.anomaly_detector = model_data['anomaly_detector']
-        self.threat_classifier = model_data['threat_classifier']
-        self.scaler = model_data['scaler']
-        self.label_encoder = model_data['label_encoder']
-        self.feature_columns = model_data['feature_columns']
-        self.is_trained = model_data['is_trained']
-        print(f"Models loaded from {model_path}")
-    
     def retrain_incremental(self, new_requests: List[Dict], new_labels: Optional[List[str]] = None):
         """Incrementally retrain models with new data"""
         if not self.is_trained:
@@ -535,12 +476,33 @@ class MLEngine:
         print("Incremental training completed!")
 
 
+def is_threat(
+    prediction: "ThreatPrediction",
+    threat_threshold: float,
+    confidence_threshold: float,
+) -> bool:
+    """The single auditable threat predicate (0B.3 / ML-1, ML-5).
+
+    Two SEPARATE decisions, never OR-ed away into one loose boolean:
+      - classifier: a non-`normal` label is a threat only at or above the
+        configured confidence threshold. A confident `normal` is NEVER a
+        threat (the old `confidence > 0.6` arm recorded 154,086 normal
+        entries as threats in one live measurement).
+      - anomaly: a decision score below the anomaly threshold is an alert
+        regardless of the label.
+    """
+    anomaly_alert = prediction.threat_score < threat_threshold
+    if prediction.threat_type == "normal":
+        return anomaly_alert
+    return prediction.confidence >= confidence_threshold or anomaly_alert
+
 class RealTimeProcessor:
     """Thread-safe real-time processor for threat detection"""
     
-    def __init__(self, ml_engine: MLEngine, threat_threshold: float = 0.1):
+    def __init__(self, ml_engine: MLEngine, threat_threshold: float = 0.1, confidence_threshold: float = 0.8):
         self.ml_engine = ml_engine
         self.threat_threshold = threat_threshold
+        self.confidence_threshold = confidence_threshold
         self.recent_threats = []
         self._lock = threading.RLock()
         self.processed_count = 0
@@ -563,13 +525,7 @@ class RealTimeProcessor:
                 prediction = predictions[0]
                 
                 # Check if it's a significant threat
-                is_threat = (
-                    prediction.threat_score < self.threat_threshold or 
-                    prediction.confidence > 0.6 or 
-                    prediction.threat_type != 'normal'
-                )
-                
-                if is_threat:
+                if is_threat(prediction, self.threat_threshold, self.confidence_threshold):
                     self.recent_threats.append(prediction)
                     logger.info(f"Threat detected: {prediction.threat_type} (score: {prediction.threat_score:.3f})")
                     
@@ -597,12 +553,10 @@ class RealTimeProcessor:
                 
                 predictions = self.ml_engine.predict_threats(requests)
                 
-                # Filter high-threat predictions (more aggressive thresholds)
+                # Filter high-threat predictions
                 threats = [
-                    pred for pred in predictions 
-                    if pred.threat_score < self.threat_threshold or 
-                       pred.confidence > 0.6 or 
-                       pred.threat_type != 'normal'
+                    pred for pred in predictions
+                    if is_threat(pred, self.threat_threshold, self.confidence_threshold)
                 ]
                 
                 self.recent_threats.extend(threats)

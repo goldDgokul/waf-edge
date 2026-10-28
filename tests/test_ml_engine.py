@@ -223,3 +223,104 @@ class TestRealTimeProcessor:
         
         assert patterns["sql_injection"] == 2
         assert patterns["xss_attack"] == 1
+
+
+# ---- 0B.3 / ML-1 + ML-2: one auditable threat predicate, one implementation ----
+
+def test_confident_normal_is_not_a_threat():
+    """ML-1: the live collector once recorded 154,086 normal-labelled
+    entries as threats because `confidence > 0.6` alone satisfied the
+    predicate. A confident `normal` must never be a threat."""
+    from src.ml_engine import is_threat
+
+    confident_normal = ThreatPrediction(
+        request_id="req_normal",
+        threat_score=0.4,          # positive = not anomalous
+        threat_type="normal",
+        confidence=1.0,
+        features_used=[],
+        timestamp=datetime.now(),
+    )
+
+    assert not is_threat(confident_normal, threat_threshold=-0.5, confidence_threshold=0.8)
+
+
+def test_non_normal_label_below_confidence_threshold_is_not_a_threat():
+    from src.ml_engine import is_threat
+
+    unsure_label = ThreatPrediction(
+        request_id="req_unsure",
+        threat_score=0.3,
+        threat_type="sql_injection",
+        confidence=0.2,
+        features_used=[],
+        timestamp=datetime.now(),
+    )
+
+    assert not is_threat(unsure_label, threat_threshold=-0.5, confidence_threshold=0.8)
+
+
+def test_anomaly_score_below_threshold_is_an_anomaly_alert():
+    """ML-5: anomaly alerts stay a SEPARATE decision from classification."""
+    from src.ml_engine import is_threat
+
+    anomaly = ThreatPrediction(
+        request_id="req_anomaly",
+        threat_score=-0.7,         # below the anomaly threshold
+        threat_type="normal",
+        confidence=0.4,
+        features_used=[],
+        timestamp=datetime.now(),
+    )
+
+    assert is_threat(anomaly, threat_threshold=-0.5, confidence_threshold=0.8)
+
+
+def test_real_time_processor_returns_no_threat_for_confident_normal():
+    """ML-1 behavioural: process_requests must filter confident normal."""
+    processor = RealTimeProcessor(ml_engine=Mock(), threat_threshold=-0.5)
+    processor.ml_engine.is_trained = True
+    processor.ml_engine.predict_threats = Mock(
+        return_value=[
+            ThreatPrediction(
+                request_id="req_normal",
+                threat_score=0.4,
+                threat_type="normal",
+                confidence=1.0,
+                features_used=[],
+                timestamp=datetime.now(),
+            )
+        ]
+    )
+
+    import asyncio
+
+    threats = asyncio.get_event_loop().run_until_complete(
+        processor.process_requests([{"url": "/"}])
+    )
+
+    assert threats == []
+    assert processor.recent_threats == []
+
+
+def test_predict_save_load_are_each_defined_exactly_once():
+    """ML-2: duplicate definitions mean the defensive implementation
+    (retry/lock/backup) is dead code while the naive one runs."""
+    import ast as ast_module
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "src" / "ml_engine.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast_module.parse(source)
+
+    names = []
+    for node in ast_module.walk(tree):
+        if isinstance(node, ast_module.ClassDef) and node.name == "MLEngine":
+            for child in node.body:
+                if isinstance(child, ast_module.FunctionDef):
+                    names.append(child.name)
+
+    for expected in ("predict_threats", "save_models", "load_models"):
+        count = names.count(expected)
+        assert count == 1, f"{expected} defined {count} times (ML-2 duplicate)"
