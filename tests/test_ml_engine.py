@@ -295,9 +295,7 @@ def test_real_time_processor_returns_no_threat_for_confident_normal():
 
     import asyncio
 
-    threats = asyncio.get_event_loop().run_until_complete(
-        processor.process_requests([{"url": "/"}])
-    )
+    threats = asyncio.run(processor.process_requests([{"url": "/"}]))
 
     assert threats == []
     assert processor.recent_threats == []
