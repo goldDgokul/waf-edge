@@ -9,7 +9,9 @@ import ipaddress
 import json
 import os
 import ssl
+import socket
 import threading
+import time
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -58,9 +60,6 @@ from .training_data_generator import TrainingDataGenerator
 # ONLY when the direct TCP peer really is the configured proxy container
 # (resolved by Docker DNS and cached), so a direct caller cannot rotate
 # buckets by forging the header.
-import socket as _socket
-import time as _time
-
 _trusted_proxy_names = [
     name.strip()
     for name in os.getenv("WAF_TRUSTED_PROXY_HOSTS", "control-panel").split(",")
@@ -71,15 +70,15 @@ _TRUSTED_PROXY_TTL_SECONDS = 30.0
 
 
 def _trusted_proxies() -> frozenset:
-    now = _time.monotonic()
+    now = time.monotonic()
     if now - _trusted_proxy_cache["resolved_at"] < _TRUSTED_PROXY_TTL_SECONDS:
         return _trusted_proxy_cache["ips"]
     resolved = set()
     for name in _trusted_proxy_names:
         try:
-            for info in _socket.getaddrinfo(name, None, proto=_socket.IPPROTO_TCP):
+            for info in socket.getaddrinfo(name, None, proto=socket.IPPROTO_TCP):
                 resolved.add(info[4][0])
-        except (_socket.gaierror, OSError):
+        except (socket.gaierror, OSError):
             logger.debug(f"Trusted proxy host not resolvable here: {name}")
     _trusted_proxy_cache["resolved_at"] = now
     _trusted_proxy_cache["ips"] = frozenset(resolved)

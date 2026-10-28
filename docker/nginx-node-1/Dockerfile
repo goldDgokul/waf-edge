@@ -60,7 +60,9 @@ EXPOSE 22 80 8080
 # ModSecurity template rendering + config copy steps) and nginx.
 #
 # CMD note (same trap as before): setting ENTRYPOINT resets CMD, so CMD is
-# restated explicitly - now with -c /etc/nginx/waf-nginx.conf to load OUR
-# main config instead of the image's rendered one.
+# restated explicitly. The main config is baked as a TEMPLATE
+# (/etc/nginx/templates/nginx.conf.template) which the entrypoint renders to
+# /etc/nginx/nginx.conf, so the plain default config path already holds OUR
+# config - no -c flag needed.
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["nginx", "-g", "daemon off;"]

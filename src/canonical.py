@@ -29,7 +29,7 @@ Design:
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Set, Union, Dict, Optional, Tuple
 from urllib.parse import unquote, unquote_plus
 
 MAX_URL_BYTES = 8192
@@ -87,12 +87,19 @@ def split_url(url: str) -> Tuple[str, str]:
     return path, query
 
 
-def _iterative_decode(text: str, form_plus: bool = False):
+def _iterative_decode(text: str, form_plus: bool = False) -> Tuple[str, int, Set[str]]:
     """Percent-decode up to MAX_DECODE_DEPTH times.
 
-    Returns (decoded_text, depth, flags). depth counts how many decode passes
-    actually changed the text; >=2 means at least double-encoded. form_plus
-    additionally treats '+' as a space (query strings / form bodies).
+    Args:
+        text: raw percent-encoded text; never mutated.
+        form_plus: additionally treat '+' as a space (query strings /
+            form bodies).
+
+    Returns:
+        Tuple of (decoded_text, depth, flags). depth counts how many decode
+        passes actually changed the text; >=2 means at least double-encoded.
+        flags carries structural anomalies (double-encoded, null-byte,
+        malformed-escape, malformed-utf8).
     """
     current = text
     depth = 0
@@ -118,11 +125,10 @@ def _iterative_decode(text: str, form_plus: bool = False):
     return current, depth, flags
 
 
-def _canonical_query(raw_query: str) -> str:
-    if not raw_query:
-        return ""
+def _decode_form_pairs(text: str) -> str:
+    """Decode each '&'-separated k=v pair and join with single spaces."""
     pairs = []
-    for chunk in raw_query.split("&"):
+    for chunk in text.split("&"):
         if not chunk:
             continue
         key, _, value = chunk.partition("=")
@@ -132,18 +138,33 @@ def _canonical_query(raw_query: str) -> str:
     return " ".join(pairs)
 
 
+def _canonical_query(raw_query: str) -> str:
+    if not raw_query:
+        return ""
+    return _decode_form_pairs(raw_query)
+
+
 def canonicalize(
     url: str,
     headers: Optional[Dict[str, str]] = None,
-    body=None,
+    body: Optional[Union[bytes, str]] = None,
     content_type: Optional[str] = None,
     method: str = "GET",
 ) -> CanonicalRequest:
     """Build the canonical request model for one request.
 
-    url/headers/body are the RAW forms. content_type falls back to the
-    Content-Type header. Nothing here raises on malformed input; problems
-    surface as flags.
+    Args:
+        url: the RAW request URL (not decoded).
+        headers: raw request headers; only SELECTED_HEADERS are carried,
+            and Cookie values are never stored (names only).
+        body: raw request body (bytes or str), or None.
+        content_type: falls back to the Content-Type header when None.
+        method: HTTP method, recorded verbatim.
+
+    Returns:
+        CanonicalRequest with raw forms preserved byte-for-byte, bounded
+        canonical forms, and structural flags. Never raises on malformed
+        input; problems surface as flags.
     """
     headers = headers or {}
     raw_url = url or ""
@@ -200,13 +221,7 @@ def canonicalize(
             if len(body_text.encode("utf-8", errors="replace")) > MAX_BODY_BYTES:
                 body_flags.add("body-too-large")
             elif ct == "application/x-www-form-urlencoded":
-                decoded_pairs = []
-                for chunk in body_text.split("&"):
-                    key, _, value = chunk.partition("=")
-                    key_d, _, _ = _iterative_decode(key, form_plus=True)
-                    value_d, _, _ = _iterative_decode(value, form_plus=True)
-                    decoded_pairs.append(f"{key_d}={value_d}")
-                canonical_body = " ".join(decoded_pairs)
+                canonical_body = _decode_form_pairs(body_text)
                 body_included = True
             elif ct == "application/json":
                 try:
