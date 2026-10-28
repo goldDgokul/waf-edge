@@ -100,6 +100,8 @@ services:
       - ./docker/nginx-node-1/html:/usr/share/nginx/html
       - ./docker/nginx-node-1/logs:/var/log/nginx
       - ./docker/shared/waf-rules:/etc/nginx/waf-rules
+      # 0B.6 (ADR 0003): per-tenant ModSecurity rules files (node1.rules)
+      - ./docker/shared/tenant-policies:/etc/nginx/tenants:ro
     depends_on:
       - log-server-1
     restart: unless-stopped
@@ -128,6 +130,8 @@ services:
       - ./docker/nginx-node-2/html:/usr/share/nginx/html
       - ./docker/nginx-node-2/logs:/var/log/nginx
       - ./docker/shared/waf-rules:/etc/nginx/waf-rules
+      # 0B.6 (ADR 0003): per-tenant ModSecurity rules files (node2.rules)
+      - ./docker/shared/tenant-policies:/etc/nginx/tenants:ro
     depends_on:
       - log-server-2
     restart: unless-stopped

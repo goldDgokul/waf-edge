@@ -47,6 +47,7 @@ NODE1_DIR = REPO_ROOT / "docker" / "nginx-node-1"
 REAL_NGINX_CONF = NODE1_DIR / "nginx.conf"
 REAL_VHOST = NODE1_DIR / "default.conf"
 REAL_BASIC = REPO_ROOT / "docker" / "shared" / "waf-rules" / "basic.conf"
+REAL_TENANTS = REPO_ROOT / "docker" / "shared" / "tenant-policies"
 REAL_API_JS = NODE1_DIR / "api.js"
 
 docker = pytest.mark.docker
@@ -94,6 +95,7 @@ def edge_port():
         "-v", f"{REAL_VHOST}:/etc/nginx/conf.d/waf-node.conf:ro",
         "-v", f"{REAL_API_JS}:/etc/nginx/api.js:ro",
         "-v", f"{REAL_BASIC}:/etc/nginx/waf-rules/basic.conf:ro",
+        "-v", f"{REAL_TENANTS}:/etc/nginx/tenants:ro",
     ]
     try:
         proc = subprocess.run(

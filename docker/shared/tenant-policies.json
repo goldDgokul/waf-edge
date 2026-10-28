@@ -1,0 +1,14 @@
+{
+  "tenants": [
+    {
+      "tenant_id": "node1",
+      "hostname": "nginx-node-1",
+      "sensitivity": 1
+    },
+    {
+      "tenant_id": "node2",
+      "hostname": "nginx-node-2",
+      "sensitivity": 1
+    }
+  ]
+}

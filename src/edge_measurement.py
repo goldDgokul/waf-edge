@@ -247,6 +247,7 @@ def spin_up_node():
             "-v", f"{node1_dir / 'default.conf'}:/etc/nginx/conf.d/waf-node.conf:ro",
             "-v", f"{node1_dir / 'api.js'}:/etc/nginx/api.js:ro",
             "-v", f"{repo_root / 'docker' / 'shared' / 'waf-rules' / 'basic.conf'}:/etc/nginx/waf-rules/basic.conf:ro",
+            "-v", f"{repo_root / 'docker' / 'shared' / 'tenant-policies'}:/etc/nginx/tenants:ro",
         ]
         try:
             proc = subprocess.run(

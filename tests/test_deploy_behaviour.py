@@ -74,6 +74,8 @@ REAL_NODE2_NGINX_CONF = NODE2_DIR / "nginx.conf"
 REAL_NODE2_VHOST = NODE2_DIR / "default.conf"
 REAL_API_JS = NODE1_DIR / "api.js"
 REAL_BASIC = REPO_ROOT / "docker" / "shared" / "waf-rules" / "basic.conf"
+# 0B.6 (ADR 0003): per-tenant ModSecurity rules files
+REAL_TENANTS = REPO_ROOT / "docker" / "shared" / "tenant-policies"
 
 # RECORDED HASHES - the drift tripwire.
 #
@@ -93,9 +95,9 @@ REAL_BASIC = REPO_ROOT / "docker" / "shared" / "waf-rules" / "basic.conf"
 # capable of breaking the pipeline and passed silently.
 EXPECTED_SHA256 = {
     REAL_NGINX_CONF: "e7e84f2ab2f9aa639841ce094fa19988c0718329ada9640ffde393c91a1f86e9",
-    REAL_VHOST: "86f8bc8913eb7f8bb48ec7f9b2b1817b8d390f18a58be543dcf21f4da118eb5c",
+    REAL_VHOST: "cc71cdd4bcd14ca832f620f1a58e71027d942fdbb14891edc075b32db495d6ce",
     REAL_NODE2_NGINX_CONF: "d35aec586969a483890ec6c333a10389018893421d7900c240c436cd7b88e5ae",
-    REAL_NODE2_VHOST: "af4ff1480fb6176cb75c2a213308cccc5368bb47b54cd90c7a9544ca967e8d55",
+    REAL_NODE2_VHOST: "059a91815d24e93334be788f150600d89cba6b3ceea991a955768e67ddbd5549",
     REAL_API_JS: "aaf7aae539895074817fd33d206ca044f168f60054cfd3c9c2a40d400c63a737",
     REAL_BASIC: "1295a8892e68cfd24b1682c12fe9b3b16fd4e7809e06e8cc97a25ec39d1b8388",
 }
@@ -246,6 +248,7 @@ class _Tree:
                 "-v", f"{self.nginx_conf}:{self.NGINX_CONF}:ro",
                 "-v", f"{self.vhost}:{self.VHOST}:ro",
                 "-v", f"{REAL_API_JS}:/etc/nginx/api.js:ro",
+                "-v", f"{REAL_TENANTS}:/etc/nginx/tenants:ro",
                 "-v", f"{self.rules_root}:{self.RULES_ROOT}:ro",
                 self.CONTAINER,
                 "/entrypoint.sh",
