@@ -101,6 +101,7 @@ export default defineConfig({
         text: 'Deployment & Operations',
         items: [
           { text: 'Production Setup', link: '/guide/production' },
+          { text: 'Edge Measurement', link: '/guide/measurement' },
           { text: 'Implementation Audit', link: '/guide/audit' },
         ],
       },

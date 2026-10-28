@@ -64,63 +64,13 @@ def _docker_available() -> bool:
 
 
 # ---------------------------------------------------------------- corpus ----
+# The labeled corpus lives in src/edge_corpus.py so the published
+# measurement (src/edge_measurement.py, docs/guide/measurement.md) and this
+# regression gate consume the SAME data. The measured-history commentary
+# lives with the data.
 
-def _get(path, headers=None):
-    return ("GET", path, headers or {}, None)
-
-
-def _post_form(path, body, headers=None):
-    form = {"Content-Type": "application/x-www-form-urlencoded"}
-    return ("POST", path, {**form, **(headers or {})}, body)
-
-
-# Entries measured BLOCKED on 2026-10-19; must stay blocked.
-# (rule_id, request spec, expected status: 403 signature block / 404 extension block)
-STILL_BLOCKED = [
-    ("sqli-union-select-query", _get("/api/search?q=union+select"), 403),
-    ("sqli-drop-table-query", _get("/api/search?q=drop+table"), 403),
-    ("xss-literal-script-query", _get("/api/search?q=<script>alert(1)</script>"), 403),
-    ("xss-literal-javascript-query", _get("/api/search?q=javascript:alert(1)"), 403),
-    ("sensitive-file-env", _get("/.env"), 404),
-    # 0B.2: under the CRS baseline / .git /config is pinned by CRS 930120
-    # with 403 (404 keeps for .env, which the static extension map returns
-    # in the rewrite phase before CRS phase 2 runs).
-    ("sensitive-file-git-config", _get("/.git/config"), 403),
-]
-
-# Measured 200-bypasses on 2026-10-19 against the nginx:alpine signature
-# baseline. On 2026-10-28 the 0B.2 slice wired the CRS engine in front of
-# the shipped config (ADR 0002) and moved the canned API/dashboard
-# responses out of the rewrite-phase fast path (njs content handlers), at
-# which point EVERY entry below measured 403 on the shipped node image.
-# They are promoted to plain assertions: they are now part of the
-# protection boundary, like STILL BLOCKED.
-PROMOTED = [
-    # canonicalisation: encoded representations of blocked literals
-    ("xss-percent-encoded-javascript", _get("/api/search?q=%6A%61%76%61%73%63%72%69%70%74%3Aalert(1)")),
-    ("xss-double-encoded-script", _get("/api/search?q=%253Cscript%253Ealert(1)%253C/script%253E")),
-    # coverage: attack classes with no signature in the internal baseline
-    ("sqli-or-1eq1", _get("/api/search?id=1+OR+1%3D1")),
-    ("traversal-dotdot-query", _get("/api/search?file=../../../etc/passwd")),
-    # placement: bodies, headers and cookies
-    ("sqli-post-body", _post_form("/api/login", "username=admin'--&password=x")),
-    ("xss-user-agent-header", _get("/api/users", {"User-Agent": "<script>alert(1)</script>"})),
-    ("xss-cookie-header", _get("/api/users", {"Cookie": "theme=<script>alert(1)</script>"})),
-]
-
-# Legitimate near-matches; must never be blocked. All target real origin
-# endpoints so an origin 404 can never be mistaken for a WAF decision.
-SAFE_TRAFFIC = [
-    ("root-page", _get("/")),
-    ("api-users", _get("/api/users")),
-    ("clean-login-post", _post_form("/api/login", "username=alice&password=hunter2")),
-    ("word-union-no-select", _get("/api/search?q=the+union+of+two+sets")),
-    ("word-select-alone", _get("/api/search?q=select+statement+in+class")),
-    ("word-drop-no-table", _get("/api/search?q=drop+everything+and+run")),
-    ("extension-near-match-in-query", _get("/?file=theme.env.bak")),
-    ("javascript-word-in-query", _get("/?next=/tutorial-javascript-basics")),
-]
-
+from src.edge_corpus import PROMOTED, SAFE_TRAFFIC
+from src.edge_corpus import BLOCKED as STILL_BLOCKED
 
 @pytest.fixture(scope="module")
 def edge_port():
@@ -198,21 +148,18 @@ def _status(port, spec):
 @pytest.mark.skipif(not _docker_available(), reason="Docker is required for corpus tests")
 class TestCorpus:
     @docker
-    @pytest.mark.parametrize(
-        "rule_id,spec,expected",
-        STILL_BLOCKED, ids=[entry[0] for entry in STILL_BLOCKED],
-    )
-    def test_measured_blocked_classes_stay_blocked(self, edge_port, rule_id, spec, expected):
-        assert _status(edge_port, spec) == expected
+    @pytest.mark.parametrize("entry", STILL_BLOCKED, ids=[e.rule_id for e in STILL_BLOCKED])
+    def test_measured_blocked_classes_stay_blocked(self, edge_port, entry):
+        assert _status(edge_port, entry.spec) == entry.expected_status
 
     @docker
-    @pytest.mark.parametrize("rule_id,spec", PROMOTED, ids=[entry[0] for entry in PROMOTED])
-    def test_promoted_bypasses_stay_blocked(self, edge_port, rule_id, spec):
-        status = _status(edge_port, spec)
+    @pytest.mark.parametrize("entry", PROMOTED, ids=[e.rule_id for e in PROMOTED])
+    def test_promoted_bypasses_stay_blocked(self, edge_port, entry):
+        status = _status(edge_port, entry.spec)
         assert status == 403, f"promoted protection regressed: HTTP {status}"
 
     @docker
-    @pytest.mark.parametrize("rule_id,spec", SAFE_TRAFFIC, ids=[entry[0] for entry in SAFE_TRAFFIC])
-    def test_safe_traffic_is_never_blocked(self, edge_port, rule_id, spec):
-        status = _status(edge_port, spec)
-        assert status == 200, f"false positive: safe request {rule_id} got HTTP {status}"
+    @pytest.mark.parametrize("entry", SAFE_TRAFFIC, ids=[e.rule_id for e in SAFE_TRAFFIC])
+    def test_safe_traffic_is_never_blocked(self, edge_port, entry):
+        status = _status(edge_port, entry.spec)
+        assert status == 200, f"false positive: safe request {entry.rule_id} got HTTP {status}"
