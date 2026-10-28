@@ -1453,11 +1453,7 @@
                                 <span class="quick-link-icon">🎯</span>
                                 <span class="quick-link-text">Prometheus Metrics</span>
                             </a>
-                            <a href="http://localhost:8000/docs" target="_blank" class="quick-link">
-                                <span class="quick-link-icon">📚</span>
-                                <span class="quick-link-text">API Documentation</span>
-                            </a>
-                            <a href="http://localhost:8000/metrics" target="_blank" class="quick-link">
+                            <a href="/metrics" target="_blank" class="quick-link">
                                 <span class="quick-link-icon">📊</span>
                                 <span class="quick-link-text">System Metrics</span>
                             </a>
@@ -1753,9 +1749,6 @@
                                     <button class="btn btn-secondary" onclick="getMLModelInfo()">
                                         📊 Model Info
                                     </button>
-                                    <button class="btn btn-warning" onclick="generateTrainingData()">
-                                        📝 Generate Data
-                                    </button>
                                 </div>
                                 <div class="training-progress" id="training-progress" style="display: none;">
                                     <div class="progress-bar">
@@ -2048,9 +2041,6 @@
                                     </button>
                                     <button class="btn btn-warning" onclick="deployRules()">
                                         🚀 Deploy Rules
-                                    </button>
-                                    <button class="btn btn-secondary" onclick="validateRules()">
-                                        ✅ Validate Rules
                                     </button>
                                     <button class="btn btn-danger btn-sm" onclick="cleanupRules()">
                                         🧹 Cleanup Expired
@@ -2702,16 +2692,6 @@
         }
         
         // ML Engine Functions
-        async function generateTrainingData() {
-            try {
-                addLog('Generating training data...', 'info');
-                const result = await apiCall('/training/generate-data', 'POST');
-                addLog(`Training data generated: ${result.message}`, 'success');
-            } catch (error) {
-                addLog(`Failed to generate training data: ${error.message}`, 'error');
-            }
-        }
-        
         async function getMLModelInfo() {
             try {
                 const result = await apiCall('/panel-status');
@@ -2784,16 +2764,6 @@
         }
         
         // WAF Rules Functions
-        async function validateRules() {
-            try {
-                addLog('Validating WAF rules...', 'info');
-                const result = await apiCall('/rules/validate', 'POST');
-                addLog(`Rules validation completed: ${result.message}`, 'success');
-            } catch (error) {
-                addLog(`Failed to validate rules: ${error.message}`, 'error');
-            }
-        }
-        
         async function exportRules() {
             try {
                 // 0A.11: previously exported a hardcoded fake rule with back-dated

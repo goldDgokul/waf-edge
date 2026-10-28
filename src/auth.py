@@ -255,15 +255,7 @@ class AuthManager:
         if token_data:
             return token_data
         
-        # Try API key
-        user = self.verify_api_key(token)
-        if user:
-            return TokenData(
-                username=user.username,
-                roles=user.roles,
-                exp=datetime.now() + timedelta(hours=24)  # API keys don't expire
-            )
-        
+                
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",

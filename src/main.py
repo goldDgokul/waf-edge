@@ -50,12 +50,56 @@ from .security_middleware import SecurityMiddleware, is_ip_whitelisted
 from .error_handling import error_recovery, degradation_manager, CircuitBreakerConfig
 from .training_data_generator import TrainingDataGenerator
 
+
+# 0A.6-H2: behind the control panel's nginx, every browser user shares the
+# panel container's IP, so keying the limiter on request.client.host
+# collapses the whole panel into one rate-limit bucket. The panel proxy
+# already forwards the real client in X-Real-IP; that header is trusted
+# ONLY when the direct TCP peer really is the configured proxy container
+# (resolved by Docker DNS and cached), so a direct caller cannot rotate
+# buckets by forging the header.
+import socket as _socket
+import time as _time
+
+_trusted_proxy_names = [
+    name.strip()
+    for name in os.getenv("WAF_TRUSTED_PROXY_HOSTS", "control-panel").split(",")
+    if name.strip()
+]
+_trusted_proxy_cache = {"resolved_at": 0.0, "ips": frozenset()}
+_TRUSTED_PROXY_TTL_SECONDS = 30.0
+
+
+def _trusted_proxies() -> frozenset:
+    now = _time.monotonic()
+    if now - _trusted_proxy_cache["resolved_at"] < _TRUSTED_PROXY_TTL_SECONDS:
+        return _trusted_proxy_cache["ips"]
+    resolved = set()
+    for name in _trusted_proxy_names:
+        try:
+            for info in _socket.getaddrinfo(name, None, proto=_socket.IPPROTO_TCP):
+                resolved.add(info[4][0])
+        except (_socket.gaierror, OSError):
+            logger.debug(f"Trusted proxy host not resolvable here: {name}")
+    _trusted_proxy_cache["resolved_at"] = now
+    _trusted_proxy_cache["ips"] = frozenset(resolved)
+    return _trusted_proxy_cache["ips"]
+
+
+def real_client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else ""
+    if peer and peer in _trusted_proxies():
+        forwarded = request.headers.get("x-real-ip", "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return peer
+
+
 # Initialize rate limiter if available
 if RATE_LIMITING_AVAILABLE:
-    limiter = Limiter(key_func=get_remote_address)
+    limiter = Limiter(key_func=real_client_ip)
 else:
     limiter = None
-
 # Custom rate limiting decorator when slowapi is not available
 def rate_limit(limit: str):
     def decorator(func):
@@ -903,7 +947,7 @@ async def get_system_health():
     
     except Exception as e:
         logger.error(f"Failed to get system health: {e}")
-        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Health check failed")
 
 
 @app.post("/api/nodes/add", dependencies=[require_admin()])
@@ -938,7 +982,7 @@ async def add_nginx_node(
     
     except Exception as e:
         logger.error(f"Failed to add node {node.node_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to add node: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to add node")
 
 
 @app.get("/api/nodes", dependencies=[require_viewer()])
@@ -966,7 +1010,7 @@ async def get_cluster_status():
         return status
     except Exception as e:
         logger.error(f"Failed to get cluster status: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get cluster status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get cluster status")
 
 
 @app.post("/api/training/start", dependencies=[require_operator()])
@@ -1027,7 +1071,7 @@ async def start_training():
         }
     except Exception as e:
         logger.error(f"Training failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Training failed")
 
 
 @app.post("/api/traffic/start-collection", dependencies=[require_operator()])
@@ -1060,7 +1104,7 @@ async def start_traffic_collection(
     
     except Exception as e:
         logger.error(f"Failed to start traffic collection: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to start traffic collection: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to start traffic collection")
 
 
 @app.get("/api/traffic/stats", dependencies=[require_viewer()])
@@ -1082,7 +1126,7 @@ async def get_traffic_stats():
     
     except Exception as e:
         logger.error(f"Failed to get traffic stats: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get traffic stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get traffic stats")
 
 
 @app.post("/api/processing/start", dependencies=[require_operator()])
@@ -1116,7 +1160,7 @@ async def start_real_time_processing():
                 logger.info("API ENDPOINT: Created new RealTimeProcessor")
             except Exception as e:
                 logger.error(f"Failed to create RealTimeProcessor: {e}")
-                raise HTTPException(status_code=500, detail=f"Failed to initialize real-time processor: {str(e)}")
+                raise HTTPException(status_code=500, detail="Failed to initialize real-time processor")
         
         # Set processing flag with proper synchronization
         system_state['is_processing'] = True
@@ -1139,7 +1183,7 @@ async def start_real_time_processing():
             system_state['is_processing'] = False
         logger.error(f"Failed to start background tasks: {e}")
         logger.error(f"Exception traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Failed to start background processing: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to start background processing")
     
     return {
         "message": "Real-time processing started",
@@ -1511,7 +1555,7 @@ async def deploy_rules(
             raise
         except Exception as e:
             logger.error(f"Failed to generate nginx configuration: {e}")
-            raise HTTPException(status_code=500, detail=f"Configuration generation failed: {str(e)}")
+            raise HTTPException(status_code=500, detail="Configuration generation failed")
         
         # Deploy to specified nodes or all nodes with comprehensive error handling
         try:
@@ -1647,7 +1691,7 @@ async def deploy_rules(
             if 'deployment_results' in locals():
                 for node_id in deployment_results.keys():
                     metrics.configuration_reloads.labels(node_id=node_id, status='failed').inc()
-            raise HTTPException(status_code=500, detail=f"Deployment failed: {str(e)}")
+            raise HTTPException(status_code=500, detail="Deployment failed")
 
         # Reached only when EVERY targeted node confirmed the rules are active.
         logger.info(
@@ -1665,7 +1709,7 @@ async def deploy_rules(
         raise
     except Exception as e:
         logger.error(f"Unexpected error during rule deployment: {e}")
-        raise HTTPException(status_code=500, detail=f"Deployment error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Deployment error")
 
 
 @app.get("/api/config/nginx", dependencies=[require_operator()])
@@ -1687,8 +1731,8 @@ async def get_nginx_config():
     
     except Exception as e:
         logger.error(f"Failed to generate nginx config: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate nginx config: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate nginx config: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate nginx config")
+        raise HTTPException(status_code=500, detail="Failed to generate nginx config")
 
 
 @app.get("/api/rules/stats", dependencies=[require_viewer()])
@@ -1715,7 +1759,7 @@ async def get_rule_stats():
         
     except Exception as e:
         logger.error(f"Failed to get rule stats: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get rule stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get rule stats")
 
 
 @app.post("/api/rules/cleanup", dependencies=[require_operator()])
@@ -1739,7 +1783,7 @@ async def cleanup_rules():
         
     except Exception as e:
         logger.error(f"Failed to cleanup rules: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to cleanup rules: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to cleanup rules")
 
 
 @app.post("/api/rules/configure", dependencies=[require_operator()])
@@ -1771,7 +1815,7 @@ async def configure_rule_limits(
         
     except Exception as e:
         logger.error(f"Failed to configure rules: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to configure rules: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to configure rules")
 
 
 @app.delete("/api/rules/expire", dependencies=[require_operator()])
@@ -1799,7 +1843,7 @@ async def expire_rules(
         
     except Exception as e:
         logger.error(f"Failed to expire rules: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to expire rules: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to expire rules")
 
 
 @app.post("/api/processing/stop", dependencies=[require_operator()])
@@ -1825,7 +1869,7 @@ async def stop_processing():
         raise
     except Exception as e:
         logger.error(f"Failed to stop processing: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to stop processing: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to stop processing")
 
 
 @app.get("/api/stats", dependencies=[require_viewer()])
@@ -1867,7 +1911,7 @@ async def get_system_stats():
     
     except Exception as e:
         logger.error(f"Failed to get system stats: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get system stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get system stats")
 
 
 
