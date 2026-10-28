@@ -11,7 +11,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.metrics import (accuracy_score, classification_report, precision_score, recall_score)
 from typing import List, Dict, Tuple, Optional
 import joblib
 import json
@@ -61,6 +61,9 @@ class MLEngine:
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self.model_version = "1.0.0"
         self.last_training_time = None
+        # ML-3: held-out evaluation metrics from the most recent training;
+        # None means "no held-out evaluation happened" (never invent one).
+        self.last_evaluation = None
         
     def _validate_request_data(self, request: Dict) -> bool:
         """Validate that request contains required fields with correct types"""
@@ -199,6 +202,7 @@ class MLEngine:
                         # Train on all data for small datasets
                         self.threat_classifier.fit(X_scaled, y_encoded)
                         logger.info(f"Threat classifier trained on {len(X_scaled)} samples (small dataset)")
+                        self.last_evaluation = None
                     else:
                         X_train, X_test, y_train, y_test = train_test_split(
                             X_scaled, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
@@ -206,12 +210,24 @@ class MLEngine:
                         
                         self.threat_classifier.fit(X_train, y_train)
                         
-                        # Evaluate model
+                        # Evaluate on the HELD-OUT split. ML-3: these numbers
+                        # (not a sample-count formula) are the exposed model
+                        # accuracy; no evaluation -> no invented accuracy.
                         y_pred = self.threat_classifier.predict(X_test)
                         logger.info("Threat Classifier Performance:")
                         logger.info(f"\n{classification_report(y_test, y_pred, target_names=self.label_encoder.classes_)}")
+                        self.last_evaluation = {
+                            "accuracy": float(accuracy_score(y_test, y_pred)),
+                            "precision": float(precision_score(
+                                y_test, y_pred, average="macro", zero_division=0)),
+                            "recall": float(recall_score(
+                                y_test, y_pred, average="macro", zero_division=0)),
+                            "test_samples": int(len(y_test)),
+                            "classes": list(self.label_encoder.classes_),
+                        }
                 else:
                     logger.warning("No labels provided - threat classifier not trained")
+                    self.last_evaluation = None
                 
                 self.is_trained = True
                 self.last_training_time = datetime.now()

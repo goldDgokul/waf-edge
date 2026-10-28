@@ -322,3 +322,89 @@ def test_predict_save_load_are_each_defined_exactly_once():
     for expected in ("predict_threats", "save_models", "load_models"):
         count = names.count(expected)
         assert count == 1, f"{expected} defined {count} times (ML-2 duplicate)"
+
+
+class TestHeldOutEvaluation:
+    """ML-3: the exposed model accuracy must come from held-out predictions,
+    not a formula on sample count. If there is no held-out evaluation (small
+    dataset, single-class split, no labels), no accuracy is invented."""
+
+    def setup_method(self):
+        self.ml_engine = MLEngine()
+
+    def _data(self, n_normal=60, n_sqli=30, n_xss=30):
+        import numpy as np
+        rng = np.random.RandomState(7)
+        requests, labels = [], []
+        for i in range(n_normal):
+            requests.append({
+                "url_length": int(rng.randint(5, 20)),
+                "body_length": int(rng.randint(0, 100)),
+                "headers_count": int(rng.randint(3, 8)),
+                "content_length": int(rng.randint(0, 100)),
+                "has_suspicious_headers": False,
+                "contains_sql_patterns": False,
+                "contains_xss_patterns": False,
+                "method": "GET",
+                "timestamp": "2024-01-01T10:00:00Z",
+            })
+            labels.append("normal")
+        for i in range(n_sqli):
+            requests.append({
+                "url_length": int(rng.randint(20, 50)),
+                "body_length": int(rng.randint(0, 50)),
+                "headers_count": int(rng.randint(3, 8)),
+                "content_length": int(rng.randint(0, 50)),
+                "has_suspicious_headers": False,
+                "contains_sql_patterns": True,
+                "contains_xss_patterns": False,
+                "method": "GET",
+                "timestamp": "2024-01-01T10:00:00Z",
+            })
+            labels.append("sql_injection")
+        for i in range(n_xss):
+            requests.append({
+                "url_length": int(rng.randint(15, 40)),
+                "body_length": int(rng.randint(50, 200)),
+                "headers_count": int(rng.randint(3, 8)),
+                "content_length": int(rng.randint(50, 200)),
+                "has_suspicious_headers": True,
+                "contains_sql_patterns": False,
+                "contains_xss_patterns": True,
+                "method": "POST",
+                "timestamp": "2024-01-01T10:00:00Z",
+            })
+            labels.append("xss_attack")
+        return requests, labels
+
+    def test_train_records_heldout_metrics(self):
+        requests, labels = self._data()
+        self.ml_engine.train_models(requests, labels)
+        ev = self.ml_engine.last_evaluation
+        assert ev is not None, "training recorded no held-out evaluation"
+        # 0.2 held-out split of 120 samples
+        assert ev["test_samples"] == 24
+        for key in ("accuracy", "precision", "recall"):
+            assert key in ev and 0.0 <= ev[key] <= 1.0
+        assert set(ev["classes"]) == {"normal", "sql_injection", "xss_attack"}
+
+    def test_accuracy_is_not_the_sample_count_formula(self):
+        requests, labels = self._data()
+        self.ml_engine.train_models(requests, labels)
+        ev = self.ml_engine.last_evaluation
+        assert ev is not None
+        simulated = min(0.85 + (len(requests) / 10000) * 0.1, 0.95)
+        # held-out accuracy is a multiple of 1/24; the formula is not
+        assert ev["accuracy"] != pytest.approx(simulated)
+
+    def test_small_dataset_has_no_invented_accuracy(self):
+        requests, labels = self._data(n_normal=15, n_sqli=0, n_xss=0)
+        self.ml_engine.train_models(requests, labels)
+        assert self.ml_engine.is_trained
+        assert self.ml_engine.last_evaluation is None
+
+    def test_no_labels_has_no_invented_accuracy(self):
+        requests, labels = self._data()
+        self.ml_engine.train_models(requests, None)
+        assert self.ml_engine.is_trained
+        assert self.ml_engine.last_evaluation is None

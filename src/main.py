@@ -1056,11 +1056,14 @@ async def start_training():
         
         ml_engine.train_models(training_data, labels)
         
-        # Update ML model accuracy metric (simulated)
-        # In a real system, you'd calculate this from validation data
-        model_accuracy = 0.85 + (len(training_data) / 10000) * 0.1  # Simulated accuracy based on data size
-        model_accuracy = min(model_accuracy, 0.95)  # Cap at 95%
-        metrics.ml_model_accuracy.set(model_accuracy)
+        # ML-3: the exposed accuracy is the HELD-OUT evaluation accuracy
+        # computed by the engine during training. No held-out evaluation
+        # (small dataset, single-class split, no labels) -> no accuracy
+        # number is invented; the metric is left untouched.
+        evaluation = getattr(ml_engine, "last_evaluation", None)
+        model_accuracy = evaluation["accuracy"] if evaluation else None
+        if model_accuracy is not None:
+            metrics.ml_model_accuracy.set(model_accuracy)
         
         logger.info(f"Training completed successfully with {len(training_data)} samples")
         return {
@@ -1068,6 +1071,7 @@ async def start_training():
             "is_trained": ml_engine.is_trained,
             "training_samples": len(training_data),
             "model_accuracy": model_accuracy,
+            "evaluation": evaluation,
             "data_source": "real_traffic" if traffic_collector and len(traffic_collector.collected_requests) >= 50 else "synthetic",
             "timestamp": datetime.now().isoformat()
         }
