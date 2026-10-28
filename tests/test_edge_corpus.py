@@ -21,11 +21,10 @@ Three groups:
       boundary) and asserted to REMAIN blocked: regressions here are release
       blockers.
 
-  BYPASSED (strict xfail) - the measured 200-through-bypass classes from the
-      same boundary table. They are marked xfail(strict=True): they document
-      today's gap, fail the suite the moment the behaviour silently changes
-      in either direction, and are promoted to plain passing assertions by
-      the 0B.2 canonicalisation/inspection slices.
+  PROMOTED - the former BYPASSED set. Strict-xfail entries until the 0B.2
+      slice (CRS baseline wiring per ADR 0002 + moving the canned API
+      responses into the content phase) measured 403 on every entry; they
+      now assert the protection boundary like STILL BLOCKED.
 
   SAFE TRAFFIC - legitimate near-matches that must never be blocked. These
       are the false-positive controls for every future signature, and they
@@ -48,6 +47,7 @@ NODE1_DIR = REPO_ROOT / "docker" / "nginx-node-1"
 REAL_NGINX_CONF = NODE1_DIR / "nginx.conf"
 REAL_VHOST = NODE1_DIR / "default.conf"
 REAL_BASIC = REPO_ROOT / "docker" / "shared" / "waf-rules" / "basic.conf"
+REAL_API_JS = NODE1_DIR / "api.js"
 
 docker = pytest.mark.docker
 
@@ -82,18 +82,27 @@ STILL_BLOCKED = [
     ("xss-literal-script-query", _get("/api/search?q=<script>alert(1)</script>"), 403),
     ("xss-literal-javascript-query", _get("/api/search?q=javascript:alert(1)"), 403),
     ("sensitive-file-env", _get("/.env"), 404),
-    ("sensitive-file-git-config", _get("/.git/config"), 404),
+    # 0B.2: under the CRS baseline / .git /config is pinned by CRS 930120
+    # with 403 (404 keeps for .env, which the static extension map returns
+    # in the rewrite phase before CRS phase 2 runs).
+    ("sensitive-file-git-config", _get("/.git/config"), 403),
 ]
 
-# Measured 200-bypasses on 2026-10-19; target is 403 under 0B.2.
-BYPASSES = [
+# Measured 200-bypasses on 2026-10-19 against the nginx:alpine signature
+# baseline. On 2026-10-28 the 0B.2 slice wired the CRS engine in front of
+# the shipped config (ADR 0002) and moved the canned API/dashboard
+# responses out of the rewrite-phase fast path (njs content handlers), at
+# which point EVERY entry below measured 403 on the shipped node image.
+# They are promoted to plain assertions: they are now part of the
+# protection boundary, like STILL BLOCKED.
+PROMOTED = [
     # canonicalisation: encoded representations of blocked literals
     ("xss-percent-encoded-javascript", _get("/api/search?q=%6A%61%76%61%73%63%72%69%70%74%3Aalert(1)")),
     ("xss-double-encoded-script", _get("/api/search?q=%253Cscript%253Ealert(1)%253C/script%253E")),
-    # coverage: attack classes with no signature at all today
+    # coverage: attack classes with no signature in the internal baseline
     ("sqli-or-1eq1", _get("/api/search?id=1+OR+1%3D1")),
     ("traversal-dotdot-query", _get("/api/search?file=../../../etc/passwd")),
-    # placement: bodies, headers and cookies are not inspected today
+    # placement: bodies, headers and cookies
     ("sqli-post-body", _post_form("/api/login", "username=admin'--&password=x")),
     ("xss-user-agent-header", _get("/api/users", {"User-Agent": "<script>alert(1)</script>"})),
     ("xss-cookie-header", _get("/api/users", {"Cookie": "theme=<script>alert(1)</script>"})),
@@ -112,30 +121,34 @@ SAFE_TRAFFIC = [
     ("javascript-word-in-query", _get("/?next=/tutorial-javascript-basics")),
 ]
 
-BYPASS_NOTE = (
-    "0B.4 corpus: measured 200-bypass; the 0B.2 slice must promote this "
-    "xfail to a plain 403 assertion when canonicalisation/inspection lands"
-)
-
 
 @pytest.fixture(scope="module")
 def edge_port():
-    """A throwaway nginx serving the repository's REAL node-1 configuration."""
+    """A throwaway container running the SHIPPED node image with the
+    repository's real configuration (compose-identical mounts)."""
     container = f"waf-corpus-{uuid.uuid4().hex[:12]}"
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
 
+    build = subprocess.run(
+        ["docker", "build", "-q", "-t", "waf-corpus-node",
+         str(NODE1_DIR)],
+        capture_output=True, text=True, timeout=900,
+    )
+    if build.returncode != 0:
+        pytest.skip(f"corpus node image failed to build: {build.stderr.strip()[:200]}")
+
+    mounts = [
+        "-v", f"{REAL_NGINX_CONF}:/etc/nginx/templates/nginx.conf.template:ro",
+        "-v", f"{REAL_VHOST}:/etc/nginx/conf.d/waf-node.conf:ro",
+        "-v", f"{REAL_API_JS}:/etc/nginx/api.js:ro",
+        "-v", f"{REAL_BASIC}:/etc/nginx/waf-rules/basic.conf:ro",
+    ]
     try:
         proc = subprocess.run(
-            [
-                "docker", "run", "-d", "--rm", "--name", container,
-                "-p", f"127.0.0.1:{port}:80",
-                "-v", f"{REAL_NGINX_CONF}:/etc/nginx/nginx.conf:ro",
-                "-v", f"{REAL_VHOST}:/etc/nginx/conf.d/default.conf:ro",
-                "-v", f"{REAL_BASIC}:/etc/nginx/waf-rules/basic.conf:ro",
-                "nginx:alpine",
-            ],
+            ["docker", "run", "-d", "--rm", "--name", container,
+             "-p", f"127.0.0.1:{port}:80", *mounts, "waf-corpus-node"],
             capture_output=True, text=True, timeout=120,
         )
         if proc.returncode != 0:
@@ -193,11 +206,10 @@ class TestCorpus:
         assert _status(edge_port, spec) == expected
 
     @docker
-    @pytest.mark.xfail(strict=True, reason=BYPASS_NOTE)
-    @pytest.mark.parametrize("rule_id,spec", BYPASSES, ids=[entry[0] for entry in BYPASSES])
-    def test_measured_bypasses_get_blocked(self, edge_port, rule_id, spec):
+    @pytest.mark.parametrize("rule_id,spec", PROMOTED, ids=[entry[0] for entry in PROMOTED])
+    def test_promoted_bypasses_stay_blocked(self, edge_port, rule_id, spec):
         status = _status(edge_port, spec)
-        assert status == 403, f"measured bypass still passes: HTTP {status}"
+        assert status == 403, f"promoted protection regressed: HTTP {status}"
 
     @docker
     @pytest.mark.parametrize("rule_id,spec", SAFE_TRAFFIC, ids=[entry[0] for entry in SAFE_TRAFFIC])

@@ -94,8 +94,9 @@ services:
       # 127.0.0.1:2222. Binding to loopback keeps the dev sshd off the LAN.
       - "127.0.0.1:2222:22"
     volumes:
-      - ./docker/nginx-node-1/nginx.conf:/etc/nginx/nginx.conf
-      - ./docker/nginx-node-1/default.conf:/etc/nginx/conf.d/default.conf
+      - ./docker/nginx-node-1/nginx.conf:/etc/nginx/templates/nginx.conf.template
+      - ./docker/nginx-node-1/default.conf:/etc/nginx/conf.d/waf-node.conf
+      - ./docker/nginx-node-1/api.js:/etc/nginx/api.js
       - ./docker/nginx-node-1/html:/usr/share/nginx/html
       - ./docker/nginx-node-1/logs:/var/log/nginx
       - ./docker/shared/waf-rules:/etc/nginx/waf-rules
@@ -119,8 +120,11 @@ services:
       # the host publish exists only for the local acceptance test (127.0.0.1:2223).
       - "127.0.0.1:2223:22"
     volumes:
-      - ./docker/nginx-node-2/nginx.conf:/etc/nginx/nginx.conf
-      - ./docker/nginx-node-2/default.conf:/etc/nginx/conf.d/default.conf
+      - ./docker/nginx-node-2/nginx.conf:/etc/nginx/templates/nginx.conf.template
+      - ./docker/nginx-node-2/default.conf:/etc/nginx/conf.d/waf-node.conf
+      # shared (node-agnostic) njs handlers; admin/dashboard are dispatched
+      # by the per-node vhost
+      - ./docker/nginx-node-1/api.js:/etc/nginx/api.js
       - ./docker/nginx-node-2/html:/usr/share/nginx/html
       - ./docker/nginx-node-2/logs:/var/log/nginx
       - ./docker/shared/waf-rules:/etc/nginx/waf-rules

@@ -72,6 +72,7 @@ REAL_NGINX_CONF = NODE1_DIR / "nginx.conf"
 REAL_VHOST = NODE1_DIR / "default.conf"
 REAL_NODE2_NGINX_CONF = NODE2_DIR / "nginx.conf"
 REAL_NODE2_VHOST = NODE2_DIR / "default.conf"
+REAL_API_JS = NODE1_DIR / "api.js"
 REAL_BASIC = REPO_ROOT / "docker" / "shared" / "waf-rules" / "basic.conf"
 
 # RECORDED HASHES - the drift tripwire.
@@ -91,10 +92,11 @@ REAL_BASIC = REPO_ROOT / "docker" / "shared" / "waf-rules" / "basic.conf"
 # per-node include into the SAME shared volume, so an edit to node 2 was just as
 # capable of breaking the pipeline and passed silently.
 EXPECTED_SHA256 = {
-    REAL_NGINX_CONF: "10ca51c3724f872829224ae3428e59a664578eee09486ad08f1ab4d0a74fba47",
-    REAL_VHOST: "755d5dac8166e3b2f8e86ed7f7ca73b2ab08bac1ad6386af8d334ec92d159272",
-    REAL_NODE2_NGINX_CONF: "f0435847a7ef245eb50a2253d87d10600b6e8f37feae26b9dd7529eb515ffe14",
-    REAL_NODE2_VHOST: "1bb95a3b72714c2dbc39b7b923b3c008a26b4a145c55422fdc41acee82ba799a",
+    REAL_NGINX_CONF: "e7e84f2ab2f9aa639841ce094fa19988c0718329ada9640ffde393c91a1f86e9",
+    REAL_VHOST: "86f8bc8913eb7f8bb48ec7f9b2b1817b8d390f18a58be543dcf21f4da118eb5c",
+    REAL_NODE2_NGINX_CONF: "d35aec586969a483890ec6c333a10389018893421d7900c240c436cd7b88e5ae",
+    REAL_NODE2_VHOST: "af4ff1480fb6176cb75c2a213308cccc5368bb47b54cd90c7a9544ca967e8d55",
+    REAL_API_JS: "aaf7aae539895074817fd33d206ca044f168f60054cfd3c9c2a40d400c63a737",
     REAL_BASIC: "1295a8892e68cfd24b1682c12fe9b3b16fd4e7809e06e8cc97a25ec39d1b8388",
 }
 
@@ -174,15 +176,35 @@ class _Tree:
     change to a vhost cannot make these tests pass against a stale idea of it.
     """
 
-    # Where the real files must appear inside nginx:alpine.
-    NGINX_CONF = "/etc/nginx/nginx.conf"
-    VHOST = "/etc/nginx/conf.d/default.conf"
+    # 0B.2: the rig now runs the SHIPPED CRS node image. The main config is
+    # mounted as the rendered-main-config TEMPLATE (the entrypoint renders it
+    # to /etc/nginx/nginx.conf before the command runs), so plain `nginx -t`
+    # and `nginx -T` validate exactly what the compose stack would load.
+    NGINX_CONF = "/etc/nginx/templates/nginx.conf.template"
+    VHOST = "/etc/nginx/conf.d/waf-node.conf"
     RULES_ROOT = "/etc/nginx/waf-rules"
-    CONTAINER = "nginx:alpine"
+    CONTAINER = "waf-corpus-node"
+
+    _image_ready = False
+
+    @classmethod
+    def _ensure_image(cls):
+        """Build the shipped node image once per session."""
+        if cls._image_ready:
+            return
+        build = subprocess.run(
+            ["docker", "build", "-q", "-t", "waf-corpus-node", str(NODE1_DIR)],
+            capture_output=True, text=True, timeout=900,
+        )
+        if build.returncode != 0:
+            pytest.skip(f"node image failed to build: {build.stderr.strip()[:200]}")
+        cls._image_ready = True
 
     def __init__(self, tmp_path: Path, node: int = 1):
         self.root = tmp_path
         self.node = node
+
+        self._ensure_image()
 
         node_dir = NODE1_DIR if node == 1 else NODE2_DIR
         self.nginx_conf = node_dir / "nginx.conf"
@@ -212,16 +234,22 @@ class _Tree:
             self.rules_file.unlink()
 
     def _run(self, args: str) -> str:
-        # Real config mounted read-only; the temp dir holds only generated rules.
+        # The stock entrypoint runs the ModSecurity template rendering only
+        # when the command is `nginx`; with any other command
+        # /etc/nginx/nginx.conf stays the image's baked default and the
+        # render never happens. The command is therefore routed through the
+        # node's own entrypoint (which renders the mounted template and
+        # completes the ModSecurity setup) before exec'ing it.
         proc = subprocess.run(
             [
                 "docker", "run", "--rm",
                 "-v", f"{self.nginx_conf}:{self.NGINX_CONF}:ro",
                 "-v", f"{self.vhost}:{self.VHOST}:ro",
+                "-v", f"{REAL_API_JS}:/etc/nginx/api.js:ro",
                 "-v", f"{self.rules_root}:{self.RULES_ROOT}:ro",
                 self.CONTAINER,
-                "sh", "-c", args,
-            ],
+                "/entrypoint.sh",
+            ] + args.split(),
             capture_output=True, text=True, timeout=120,
         )
         return (proc.stdout or "") + (proc.stderr or "")
@@ -329,7 +357,7 @@ def test_fixture_mounts_the_repository_config_unchanged():
     )
 
     # The guarded set must include the files the fixtures actually mount.
-    for real in (REAL_NGINX_CONF, REAL_VHOST, REAL_NODE2_VHOST, REAL_BASIC):
+    for real in (REAL_NGINX_CONF, REAL_VHOST, REAL_NODE2_VHOST, REAL_API_JS, REAL_BASIC):
         assert real in EXPECTED_SHA256, (
             f"{real.name} is mounted by these fixtures but is not on the tripwire, "
             f"so an edit to it would pass unnoticed"
