@@ -8,6 +8,8 @@ import asyncio
 import json
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+
+from .canonical import canonicalize
 from datetime import datetime
 import httpx
 from loguru import logger
@@ -29,8 +31,13 @@ class HttpRequest:
     content_length: int
     node_id: str = 'nginx-node-1'  # Add node_id field with default
     
+    def _canonical(self):
+        """0B.1: canonical request model (raw preserved, bounded decode)."""
+        return canonicalize(url=self.url, headers=self.headers, body=self.body)
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for ML processing"""
+        canonical = self._canonical()
         return {
             'timestamp': self.timestamp.isoformat(),
             'method': self.method,
@@ -43,6 +50,8 @@ class HttpRequest:
             'node_id': self.node_id,
             'has_suspicious_headers': self._check_suspicious_headers(),
             'url_length': len(self.url),
+            'canonical_query': canonical.canonical_query,
+            'decode_flags': list(canonical.decode_flags),
             'contains_sql_patterns': self._check_sql_patterns(),
             'contains_xss_patterns': self._check_xss_patterns()
         }
@@ -56,17 +65,13 @@ class HttpRequest:
     def _check_sql_patterns(self) -> bool:
         """Check for SQL injection patterns"""
         sql_patterns = ['union select', 'or 1=1', "or '1'='1", 'drop table', 'select * from']
-        url_lower = self.url.lower()
-        body_lower = (self.body or '').lower()
-        combined = f"{url_lower} {body_lower}"
+        combined = self._canonical().inspection_text().lower()
         return any(pattern in combined for pattern in sql_patterns)
     
     def _check_xss_patterns(self) -> bool:
         """Check for XSS patterns"""
         xss_patterns = ['<script', 'javascript:', 'onerror=', 'onload=']
-        url_lower = self.url.lower()
-        body_lower = (self.body or '').lower()
-        combined = f"{url_lower} {body_lower}"
+        combined = self._canonical().inspection_text().lower()
         return any(pattern in combined for pattern in xss_patterns)
 
 
