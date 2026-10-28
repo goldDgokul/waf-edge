@@ -9,6 +9,13 @@
       "tenant_id": "node2",
       "hostname": "nginx-node-2",
       "sensitivity": 1
+    },
+    {
+      "tenant_id": "acme",
+      "hostname": "acme.edge.test",
+      "sensitivity": 1,
+      "origin_url": "http://test-origin:8090",
+      "max_body_size": "1m"
     }
   ]
 }

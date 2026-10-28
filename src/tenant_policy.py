@@ -35,6 +35,19 @@ GENERATED_DIR = REPO_ROOT / "docker" / "shared" / "tenant-policies"
 # CRS reserves 1xxxxx for local custom rules; ctl exclusions get ids here.
 CTL_RULE_ID_BASE = 100000
 
+# 0C.2 (EC2): a tenant body-size ceiling is bounded by node capacity.
+NODE_MAX_BODY_SIZE = "10m"
+
+
+def _parse_size(value: str) -> int:
+    """Parse an nginx size literal ('1m', '512k', '4096') into bytes."""
+    import re
+    match = re.fullmatch(r"(\d+)([km]?)", str(value))
+    if not match:
+        raise ValueError(f"invalid size literal {value!r} (use e.g. '1m', '512k')")
+    number, unit = int(match.group(1)), match.group(2)
+    return number * {"": 1, "k": 1024, "m": 1024 * 1024}[unit]
+
 
 @dataclass(frozen=True)
 class RuleExclusion:
@@ -65,6 +78,12 @@ class TenantPolicy:
     sensitivity: int = 1          # CRS paranoia level 1..4
     exclusions: Tuple[RuleExclusion, ...] = ()
     rate_limit: Optional[RateLimit] = None
+    # 0D.1: a tenant with an origin_url gets a proxy vhost rendered for it;
+    # a tenant without one keeps only its ModSecurity rules file (demo
+    # tenants keep their canned vhosts from waf-node.conf).
+    origin_url: Optional[str] = None
+    # 0C.2: per-tenant body size, bounded by node capacity.
+    max_body_size: str = "1m"
 
     def __post_init__(self):
         if not self.tenant_id:
@@ -73,6 +92,10 @@ class TenantPolicy:
             raise ValueError("hostname must be non-empty")
         if self.sensitivity not in (1, 2, 3, 4):
             raise ValueError(f"sensitivity must be 1..4, got {self.sensitivity}")
+        if _parse_size(self.max_body_size) > _parse_size(NODE_MAX_BODY_SIZE):
+            raise ValueError(
+                f"max_body_size {self.max_body_size} exceeds node capacity "
+                f"{NODE_MAX_BODY_SIZE}")
 
 
 def validate_policies(policies: List[TenantPolicy]) -> List[TenantPolicy]:
@@ -108,6 +131,8 @@ def load_policies(path: Path = None) -> List[TenantPolicy]:
                           burst=item["rate_limit"].get("burst", 0))
                 if item.get("rate_limit") else None
             ),
+            origin_url=item.get("origin_url"),
+            max_body_size=item.get("max_body_size", "1m"),
         )
         for item in raw["tenants"]
     ]
@@ -162,3 +187,87 @@ def render_vhost_snippet(policy: TenantPolicy) -> str:
             f"burst={policy.rate_limit.burst} nodelay;"
         )
     return "\n".join(lines)
+
+
+def render_tenant_vhost(policy: TenantPolicy) -> str:
+    """0D.1: render ONE tenant's proxy server block. Tenants without an
+    origin render nothing (their hostname stays owned by the demo vhost;
+    a duplicate server_name would be a misconfiguration, not a feature)."""
+    if not policy.origin_url:
+        return ""
+    lines = [
+        "server {",
+        "    listen 80;",
+        f"    server_name {policy.hostname};",
+        "",
+        f"    # tenant: {policy.tenant_id} (sensitivity {policy.sensitivity})",
+        f"    client_max_body_size {policy.max_body_size};",
+        "    # 0C.5 position: caching is refused for the first release (ADR 0004).",
+        "    gzip off;",
+        "",
+        "    modsecurity_rules_file /etc/nginx/tenants/" + policy.tenant_id + ".rules;",
+        "",
+        "    location / {",
+        f"        # resolved at runtime via the docker embedded resolver so the",
+        f"        # edge starts even when an origin is down (then 502, EC3).",
+        f"        set $origin_upstream {policy.origin_url};",
+        f"        resolver 127.0.0.11 valid=10s ipv6=off;",
+        f"        proxy_pass $origin_upstream;",
+        "        proxy_http_version 1.1;",
+        "        # 0C.1 (EC1) trust policy: the edge OVERWRITES any",
+        "        # client-supplied forwarding headers with what it observed.",
+        "        proxy_set_header Host $host;",
+        "        proxy_set_header X-Forwarded-For $remote_addr;",
+        "        proxy_set_header X-Forwarded-Proto $scheme;",
+        "        proxy_set_header X-Real-IP $remote_addr;",
+        "        # 0C.4 (EC4): upgrade negotiation is forwarded; upgraded frames",
+        "        # pass AFTER CRS inspected the upgrade request itself.",
+        "        proxy_set_header Upgrade $http_upgrade;",
+        "        proxy_set_header Connection $connection_upgrade;",
+        "        # 0C.3 (EC3) timeouts",
+        "        proxy_connect_timeout 5s;",
+        "        proxy_send_timeout 30s;",
+        "        proxy_read_timeout 30s;",
+        "    }",
+        "",
+        "    # 0C.3 (EC3) defined origin-failure response; alerting consumes the",
+        "    # access-log 502/504 stream shipped by promtail.",
+        "    error_page 502 503 504 =502 @origin_failure;",
+        "    location @origin_failure {",
+        "        default_type application/json;",
+        "        return 200 '{\"error\":\"edge_origin_unavailable\"}';",
+        "    }",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def render_vhosts_file(policies: List[TenantPolicy]) -> str:
+    """0D: the generated conf.d file - upgrade map (once), a default server
+    that REFUSES unknown hosts (0D.2), and one server block per proxy
+    tenant (0D.1)."""
+    lines = [
+        "# GENERATED by src/tenant_policy.py from docker/shared/tenant-policies.json",
+        "# - edit the JSON source, not this file; staleness is tested.",
+        "# 0D.1/0D.2 (ADR 0004): tenant vhosts + explicit default refusal.",
+        "",
+        "# 0C.4 (EC4): upgrade negotiation map, http scope, rendered once.",
+        "map $http_upgrade $connection_upgrade {",
+        "    default upgrade;",
+        "    ''      close;",
+        "}",
+        "",
+        "# 0D.2 (T11): a Host/SNI matching no tenant must be REFUSED -",
+        "# never served by whichever vhost happens to be first.",
+        "server {",
+        "    listen 80 default_server;",
+        "    server_name _;",
+        "    return 421;",
+        "}",
+        "",
+    ]
+    for policy in policies:
+        vhost = render_tenant_vhost(policy)
+        if vhost:
+            lines.append(vhost)
+    return "\n".join(lines) + "\n"

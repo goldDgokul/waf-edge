@@ -96,6 +96,7 @@ def edge_port():
         "-v", f"{REAL_API_JS}:/etc/nginx/api.js:ro",
         "-v", f"{REAL_BASIC}:/etc/nginx/waf-rules/basic.conf:ro",
         "-v", f"{REAL_TENANTS}:/etc/nginx/tenants:ro",
+        "-v", f"{REAL_TENANTS / 'vhosts.conf'}:/etc/nginx/conf.d/waf-tenants.conf:ro",
     ]
     try:
         proc = subprocess.run(
@@ -108,7 +109,11 @@ def edge_port():
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
-                if requests.get(f"http://127.0.0.1:{port}/", timeout=2).status_code == 200:
+                # 0D.2: the default server refuses unknown Hosts, so the
+                # readiness probe must name the demo vhost explicitly.
+                if requests.get(f"http://127.0.0.1:{port}/",
+                                headers={"Host": "nginx-node-1"},
+                                timeout=2).status_code == 200:
                     break
             except requests.RequestException:
                 time.sleep(0.4)

@@ -248,6 +248,7 @@ class _Tree:
                 "-v", f"{self.nginx_conf}:{self.NGINX_CONF}:ro",
                 "-v", f"{self.vhost}:{self.VHOST}:ro",
                 "-v", f"{REAL_API_JS}:/etc/nginx/api.js:ro",
+                "-v", f"{REAL_TENANTS / 'vhosts.conf'}:/etc/nginx/conf.d/waf-tenants.conf:ro",
                 "-v", f"{REAL_TENANTS}:/etc/nginx/tenants:ro",
                 "-v", f"{self.rules_root}:{self.RULES_ROOT}:ro",
                 self.CONTAINER,

@@ -102,6 +102,8 @@ services:
       - ./docker/shared/waf-rules:/etc/nginx/waf-rules
       # 0B.6 (ADR 0003): per-tenant ModSecurity rules files (node1.rules)
       - ./docker/shared/tenant-policies:/etc/nginx/tenants:ro
+      # 0D.1 (ADR 0004): generated tenant vhosts + default-refuse server
+      - ./docker/shared/tenant-policies/vhosts.conf:/etc/nginx/conf.d/waf-tenants.conf:ro
     depends_on:
       - log-server-1
     restart: unless-stopped
@@ -132,8 +134,22 @@ services:
       - ./docker/shared/waf-rules:/etc/nginx/waf-rules
       # 0B.6 (ADR 0003): per-tenant ModSecurity rules files (node2.rules)
       - ./docker/shared/tenant-policies:/etc/nginx/tenants:ro
+      # 0D.1 (ADR 0004): generated tenant vhosts + default-refuse server
+      - ./docker/shared/tenant-policies/vhosts.conf:/etc/nginx/conf.d/waf-tenants.conf:ro
     depends_on:
       - log-server-2
+    restart: unless-stopped
+
+  # 0C.9 (ADR 0004): the proxy-correctness observation origin. Records what
+  # it received (client address, forwarded headers, Host, body size, upgrade
+  # negotiation) so the 0D tenant-vhost claims are verified by observation.
+  test-origin:
+    build:
+      context: ./docker/test-origin
+      dockerfile: Dockerfile
+    container_name: test-origin
+    ports:
+      - "127.0.0.1:8084:8090"
     restart: unless-stopped
 
   # Log server for nginx-node-1 (provides API for traffic logs)
