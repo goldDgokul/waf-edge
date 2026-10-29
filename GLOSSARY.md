@@ -188,3 +188,24 @@ reported as the same thing.
 The status labels used throughout the build plan. Observed in code or reproduced
 on the running system; decided by the CEO; a technical recommendation not yet
 approved; awaiting a decision that cannot be answered from the code.
+
+---
+
+## State and storage (Phase 1)
+
+**amnesia defect**
+The pre-Phase-1 state: tenant identity and generated rules lived only in
+process memory, so a restart wiped them. "A hosted multi-tenant product
+cannot ship with amnesia" is why persistence is plan item 1.0.
+
+**control-plane store**
+The durable database holding ONLY control-plane data - users, API-key
+digests, generated rules, audit rows. Threat and traffic telemetry
+deliberately stays out of it: that belongs to the log and metrics pipeline
+(Section 7 of the plan).
+
+**write-through**
+The persistence discipline: the in-memory structures remain the live state,
+and every mutation is written to the control-plane store at the moment it
+happens, with components hydrating from the store on startup. Neither copy
+is authoritative alone; a restart is safe only when both halves work.

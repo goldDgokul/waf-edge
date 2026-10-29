@@ -9,8 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 import ipaddress
 import json
+import os
 import re
 from loguru import logger
+
+from .persistence import Store
 
 
 @dataclass
@@ -92,7 +95,7 @@ class WAFRule:
 class WAFRuleGenerator:
     """Generates WAF rules based on threat predictions"""
     
-    def __init__(self, max_rules=50, default_expiry_minutes=30):
+    def __init__(self, max_rules=50, default_expiry_minutes=30, db_path=None):
         self.active_rules = []
         self.rule_counter = 0
         self.max_rules = max_rules  # Maximum number of active rules
@@ -102,6 +105,69 @@ class WAFRuleGenerator:
             'expired_rules': 0,
             'active_rules': 0
         }
+        self.store = self._open_store(db_path)
+        if self.store:
+            self._hydrate_from_store()
+
+    def _open_store(self, db_path) -> Optional[Store]:
+        """Open the durable store; memory-only if it cannot be opened."""
+        if db_path is None:
+            db_path = os.getenv('WAF_DB_PATH', 'data/waf.db')
+        try:
+            return Store(db_path)
+        except Exception as e:
+            logger.warning(
+                f"Durable store unavailable ({e}); rules will not survive restart"
+            )
+            return None
+
+    def _hydrate_from_store(self):
+        """Load persisted rules; drop the already-expired ones.
+
+        The rule counter resumes past the highest persisted id so a
+        restarted process never reuses a rule id.
+        """
+        now = datetime.now()
+        for payload in self.store.load_rules():
+            created = datetime.fromisoformat(payload['created_at'])
+            expires = payload.get('expires_at')
+            expires = datetime.fromisoformat(expires) if expires else None
+            if expires is not None and expires <= now:
+                continue
+            self.active_rules.append(WAFRule(
+                rule_id=payload['rule_id'],
+                rule_type=payload['rule_type'],
+                condition=payload['condition'],
+                action=payload['action'],
+                description=payload['description'],
+                severity=payload['severity'],
+                created_at=created,
+                expires_at=expires,
+            ))
+            digits = re.findall(r"\d+", payload['rule_id'])
+            if digits:
+                self.rule_counter = max(self.rule_counter, int(digits[-1]))
+        self.rule_stats['active_rules'] = len(self.active_rules)
+
+    def persist_active_rules(self):
+        """Write-through: the store mirrors the current active rule set."""
+        if not self.store:
+            return
+        payloads = []
+        for rule in self.active_rules:
+            if rule.expires_at is not None and rule.expires_at <= datetime.now():
+                continue
+            payloads.append((rule.rule_id, {
+                'rule_id': rule.rule_id,
+                'rule_type': rule.rule_type,
+                'condition': rule.condition,
+                'action': rule.action,
+                'description': rule.description,
+                'severity': rule.severity,
+                'created_at': rule.created_at.isoformat(),
+                'expires_at': rule.expires_at.isoformat() if rule.expires_at else None,
+            }))
+        self.store.save_rules(payloads)
     
     def cleanup_expired_rules(self) -> int:
         """Remove expired rules and return count of removed rules"""
@@ -118,6 +184,7 @@ class WAFRuleGenerator:
         self.rule_stats['active_rules'] = len(self.active_rules)
         
         if expired_count > 0:
+            self.persist_active_rules()
             logger.info(f"Cleaned up {expired_count} expired WAF rules")
         
         return expired_count
@@ -190,6 +257,9 @@ class WAFRuleGenerator:
         
         # Enforce rule limits
         self.enforce_rule_limits()
+        
+        # Write-through so rules survive a restart (Phase 1.0)
+        self.persist_active_rules()
         
         # Update stats
         self.rule_stats['active_rules'] = len(self.active_rules)

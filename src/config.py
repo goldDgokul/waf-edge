@@ -87,6 +87,9 @@ class SystemConfig:
     metrics_enabled: bool = True
     metrics_port: int = 9090
     
+    # Durable control-plane storage (Phase 1.0)
+    db_path: str = "data/waf.db"
+    
     def __post_init__(self):
         """Initialize security config if not provided"""
         if self.security is None:
@@ -165,7 +168,9 @@ class SystemConfig:
             log_file=os.getenv('WAF_AI_LOG_FILE', 'logs/waf_ai.log'),
             
             metrics_enabled=os.getenv('WAF_AI_METRICS_ENABLED', 'true').lower() == 'true',
-            metrics_port=int(os.getenv('WAF_AI_METRICS_PORT', '9090'))
+            metrics_port=int(os.getenv('WAF_AI_METRICS_PORT', '9090')),
+
+            db_path=os.getenv('WAF_DB_PATH', 'data/waf.db')
         )
     
     @classmethod

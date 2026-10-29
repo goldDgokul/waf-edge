@@ -5,6 +5,7 @@ Provides API key authentication, JWT tokens, and role-based access control.
 """
 
 import os
+import json
 import jwt
 import hashlib
 import secrets
@@ -12,6 +13,8 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 from fastapi import HTTPException, Depends, status
+
+from .persistence import Store, key_digest
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import bcrypt
@@ -58,17 +61,66 @@ class AuthConfig:
 class AuthManager:
     """Manages authentication and authorization"""
     
-    def __init__(self):
+    def __init__(self, db_path: Optional[str] = None):
         self.config = AuthConfig()
+        self.store = self._open_store(db_path)
         self.users: Dict[str, User] = {}
-        self.api_keys: Dict[str, str] = {}  # api_key -> username
+        self.api_keys: Dict[str, str] = {}  # key digest -> username
         self.security = HTTPBearer()
+        if self.store:
+            self._hydrate_from_store()
         
         # Initialize with default admin user if no users exist
         self._init_default_admin()
+
+    def _open_store(self, db_path: Optional[str]) -> Optional[Store]:
+        """Open the durable store; memory-only if it cannot be opened."""
+        if db_path is None:
+            db_path = os.getenv('WAF_DB_PATH', 'data/waf.db')
+        try:
+            return Store(db_path)
+        except Exception as e:
+            logger.warning(
+                f"Durable store unavailable ({e}); running memory-only - "
+                "state will be lost on restart"
+            )
+            return None
+
+    def _hydrate_from_store(self):
+        """Load users and API-key digests persisted by an earlier run."""
+        for row in self.store.load_users():
+            self.users[row['username']] = User(
+                username=row['username'],
+                password_hash=row['password_hash'],
+                roles=json.loads(row['roles']),
+                api_keys=json.loads(row['api_keys']),
+                created_at=datetime.fromisoformat(row['created_at']),
+                last_login=(
+                    datetime.fromisoformat(row['last_login'])
+                    if row['last_login'] else None
+                ),
+                is_active=bool(row['is_active']),
+            )
+        self.api_keys.update(self.store.load_api_keys())
+
+    def _persist_user(self, user: User):
+        if not self.store:
+            return
+        self.store.save_user(
+            username=user.username,
+            password_hash=user.password_hash,
+            roles=user.roles,
+            api_key_hashes=user.api_keys,
+            created_at=user.created_at,
+            last_login=user.last_login,
+            is_active=user.is_active,
+        )
     
     def _init_default_admin(self):
         """Initialize default admin user"""
+        if 'admin' in self.users:
+            return  # hydrated from the store; do not duplicate or reset
+        
         # 0A.6: no fixed default password. If WAF_ADMIN_PASSWORD is not set, a
         # random one is generated (matching how WAF_JWT_SECRET already behaves) so
         # the default credential is unpredictable rather than "admin123".
@@ -117,6 +169,9 @@ class AuthManager:
         )
         
         self.users[username] = user
+        self._persist_user(user)
+        if self.store:
+            self.store.audit('system', 'create_user', f"user={username}")
         logger.info(f"Created user: {username} with roles: {roles}")
         return user
     
@@ -128,6 +183,7 @@ class AuthManager:
         
         if self.verify_password(password, user.password_hash):
             user.last_login = datetime.now()
+            self._persist_user(user)
             logger.info(f"User authenticated: {username}")
             return user
         
@@ -144,19 +200,36 @@ class AuthManager:
             )
         
         api_key = secrets.token_urlsafe(self.config.api_key_length)
-        user.api_keys.append(api_key)
-        self.api_keys[api_key] = username
+        digest = key_digest(api_key)
+        # Only the digest is kept anywhere: the plaintext key exists solely
+        # in this return value for the caller to show once.
+        user.api_keys.append(digest)
+        self.api_keys[digest] = username
+        if self.store:
+            self.store.save_api_key(digest, username)
+            self._persist_user(user)
+            self.store.audit(
+                'system', 'generate_api_key', f"user={username} key_digest={digest}"
+            )
         
         logger.info(f"Generated API key for user: {username}")
         return api_key
     
     def revoke_api_key(self, api_key: str) -> bool:
         """Revoke an API key"""
-        username = self.api_keys.pop(api_key, None)
+        digest = key_digest(api_key)
+        username = self.api_keys.pop(digest, None)
         if username:
             user = self.users.get(username)
-            if user and api_key in user.api_keys:
-                user.api_keys.remove(api_key)
+            if user and digest in user.api_keys:
+                user.api_keys.remove(digest)
+            if self.store:
+                self.store.revoke_api_key(digest)
+                if user:
+                    self._persist_user(user)
+                self.store.audit(
+                    'system', 'revoke_api_key', f"user={username} key_digest={digest}"
+                )
             logger.info(f"Revoked API key for user: {username}")
             return True
         return False
@@ -215,7 +288,7 @@ class AuthManager:
     
     def verify_api_key(self, api_key: str) -> Optional[User]:
         """Verify API key and return user"""
-        username = self.api_keys.get(api_key)
+        username = self.api_keys.get(key_digest(api_key))
         if username:
             user = self.users.get(username)
             if user and user.is_active:

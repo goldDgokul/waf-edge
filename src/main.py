@@ -375,7 +375,8 @@ async def startup_components():
                 # Use configuration values for limits
                 waf_rule_generator = WAFRuleGenerator(
                     max_rules=config.waf_max_rules,
-                    default_expiry_minutes=config.waf_default_expiry_minutes
+                    default_expiry_minutes=config.waf_default_expiry_minutes,
+                    db_path=config.db_path
                 )
                 component_manager.set_component('waf_rule_generator', waf_rule_generator)
                 logger.info(f"WAF rule generator initialized with max_rules={config.waf_max_rules}, "

@@ -22,6 +22,20 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # ---------------------------------------------------------------------------
+# Phase 1.0 - the control plane now persists to sqlite. The module-level
+# AuthManager/WAFRuleGenerator singletons open the configured store at import
+# time, so without this override every test session would share (and pollute)
+# the repository's data/waf.db and users created by one run would make the
+# next run's create_user fail with "already exists". Each session gets its
+# own temp file instead; src.auth reads WAF_DB_PATH when it is imported by
+# the first test module, which happens after this line.
+# ---------------------------------------------------------------------------
+if "WAF_DB_PATH" not in os.environ:
+    os.environ["WAF_DB_PATH"] = os.path.join(
+        tempfile.gettempdir(), f"waf-test-{os.getpid()}.db"
+    )
+
+# ---------------------------------------------------------------------------
 # 0A.7(b) — QUARANTINE the five uncollectable test files.
 #
 # These five files abort collection with ImportErrors for symbols that are
